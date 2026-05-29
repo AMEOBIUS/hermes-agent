@@ -1452,8 +1452,30 @@ class DiscordAdapter(BasePlatformAdapter):
                 return await self._send_to_forum(channel, content)
 
             # Format and split message if needed
-            formatted = self.format_message(content)
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            embeds_to_send = None
+            content_to_send = content
+            if content.strip().startswith("{") and content.strip().endswith("}"):
+                try:
+                    parsed = json.loads(content)
+                    if "embeds" in parsed or "embed" in parsed or "content" in parsed:
+                        content_to_send = parsed.get("content", "")
+                        raw_embeds = parsed.get("embeds", [])
+                        if "embed" in parsed:
+                            raw_embeds = [parsed["embed"]] + raw_embeds
+                        
+                        import discord
+                        embeds_to_send = []
+                        for e_dict in raw_embeds:
+                            if hasattr(discord.Embed, "from_dict"):
+                                embeds_to_send.append(discord.Embed.from_dict(e_dict))
+                except Exception as e:
+                    logger.debug("Failed to parse JSON content for embed: %s", e)
+
+            if embeds_to_send:
+                chunks = [content_to_send] if content_to_send else [""]
+            else:
+                formatted = self.format_message(content)
+                chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
             message_ids = []
             reference = None
@@ -1474,10 +1496,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
+                    if embeds_to_send and i == len(chunks) - 1:
+                        msg = await channel.send(
+                            content=chunk or None,
+                            embeds=embeds_to_send,
+                            reference=chunk_reference,
+                        )
+                    else:
+                        msg = await channel.send(
+                            content=chunk,
+                            reference=chunk_reference,
+                        )
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -6227,7 +6256,17 @@ async def _standalone_send(
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             # Send text message (skip if empty and media is present)
             if message.strip() or not media_files:
-                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
+                payload = {"content": message}
+                if message.strip().startswith("{") and message.strip().endswith("}"):
+                    try:
+                        parsed = json.loads(message)
+                        if "embeds" in parsed or "embed" in parsed or "content" in parsed:
+                            payload = parsed
+                            if "embed" in payload and "embeds" not in payload:
+                                payload["embeds"] = [payload.pop("embed")]
+                    except Exception:
+                        pass
+                async with session.post(url, headers=json_headers, json=payload, **_req_kw) as resp:
                     if resp.status not in {200, 201}:
                         body = await resp.text()
                         return {"error": f"Discord API error ({resp.status}): {body}"}

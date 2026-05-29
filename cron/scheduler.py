@@ -753,23 +753,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception:
         pass
 
-    if wrap_response:
-        task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
-    else:
-        delivery_content = content
-
-    # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
     try:
         config = load_gateway_config()
@@ -784,6 +768,54 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+
+        # Target-specific delivery wrapping and media extraction
+        if wrap_response:
+            task_name = job.get("name", job["id"])
+            job_id = job.get("id", "")
+            if platform_name.lower() == "discord":
+                is_failed = "failed:" in content.lower() and "cron job" in content.lower()
+                embed_color = 0xFF3333 if is_failed else 0x00FFCC
+                embed_title = f"❌ Cronjob Failed: {task_name}" if is_failed else f"🔄 Cronjob Executed: {task_name}"
+                
+                sched_val = job.get("schedule_display") or job.get("schedule")
+                if isinstance(sched_val, dict):
+                    sched_val = sched_val.get("display") or sched_val.get("expr", "")
+                
+                # Extract media from raw content so description doesn't have MEDIA: tags
+                media_files, cleaned_content = BasePlatformAdapter.extract_media(content)
+                
+                embed_payload = {
+                    "embeds": [
+                        {
+                            "title": embed_title,
+                            "description": cleaned_content.strip(),
+                            "color": embed_color,
+                            "fields": [
+                                {"name": "🆔 Job ID", "value": f"`{job_id}`", "inline": True},
+                                {"name": "⏰ Schedule", "value": f"`{sched_val}`", "inline": True}
+                            ],
+                            "footer": {
+                                "text": f"EDGE // cron-scheduler • stop reminder {task_name}"
+                            },
+                            "timestamp": _hermes_now().isoformat()
+                        }
+                    ]
+                }
+                cleaned_delivery_content = json.dumps(embed_payload)
+            else:
+                delivery_content = (
+                    f"Cronjob Response: {task_name}\n"
+                    f"(job_id: {job_id})\n"
+                    f"-------------\n\n"
+                    f"{content}\n\n"
+                    f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+                )
+                media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+        else:
+            media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(content)
+
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
