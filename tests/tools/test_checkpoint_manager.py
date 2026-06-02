@@ -580,6 +580,21 @@ class TestErrorResilience:
             "Git executable not found" in r.getMessage() for r in caplog.records
         )
 
+    def test_ensure_checkpoint_missing_workdir_is_debug_skip_not_error(
+        self, checkpoint_base, tmp_path, monkeypatch, caplog,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        missing = tmp_path / "new-systemd-dropin"
+        mgr = CheckpointManager(enabled=True)
+        with caplog.at_level(logging.ERROR, logger="tools.checkpoint_manager"):
+            assert mgr.ensure_checkpoint(str(missing), "pre-create write") is False
+        assert not caplog.records
+        assert str(missing.resolve()) not in mgr._checkpointed_dirs
+
+        missing.mkdir()
+        (missing / "override.conf").write_text("[Service]\nTimeoutStartSec=20min\n")
+        assert mgr.ensure_checkpoint(str(missing), "post-create write") is True
+
     def test_run_git_missing_git_reports_git_not_found(
         self, tmp_path, monkeypatch, caplog,
     ):

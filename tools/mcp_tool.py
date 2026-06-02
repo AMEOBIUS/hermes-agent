@@ -86,7 +86,6 @@ import math
 import os
 import re
 import shutil
-import sys
 import threading
 import time
 from datetime import datetime
@@ -113,17 +112,182 @@ logger = logging.getLogger(__name__)
 #
 # Fallback is os.devnull if opening the log file fails for any reason.
 
+_MCP_STDERR_DEFAULT_MAX_BYTES = 10 * 1024 * 1024
 _mcp_stderr_log_fh: Optional[Any] = None
 _mcp_stderr_log_lock = threading.Lock()
 
 
+def _mcp_stderr_max_bytes() -> int:
+    """Return the per-profile MCP stderr cap.
+
+    Keep this local and fail-closed: bad env values fall back to the default
+    rather than disabling rotation.  A 1 MiB floor avoids pathological configs
+    that would rotate on every log line.
+    """
+    try:
+        value = int(os.environ.get(
+            "HERMES_MCP_STDERR_LOG_MAX_BYTES",
+            str(_MCP_STDERR_DEFAULT_MAX_BYTES),
+        ))
+    except (TypeError, ValueError):
+        value = _MCP_STDERR_DEFAULT_MAX_BYTES
+    return max(1024 * 1024, value)
+
+
+class _McpStderrSink:
+    """Bounded fd-backed sink for stdio MCP subprocess stderr.
+
+    ``stdio_client(..., errlog=...)`` needs a real file descriptor so the child
+    process can inherit it.  A plain append-mode file met that contract but let
+    chatty servers grow ``mcp-stderr.log`` without bound.  The sink gives the
+    subprocess a pipe fd, drains it in a daemon thread, and rotates the backing
+    log before it crosses ``max_bytes``.  If a single MCP session is noisy, the
+    active log still stays bounded instead of waiting for the next Hermes
+    restart.
+    """
+
+    def __init__(self, log_path, max_bytes: int) -> None:
+        self.log_path = log_path
+        self.max_bytes = max(1, int(max_bytes))
+        self._lock = threading.RLock()
+        self._fh: Optional[Any] = None
+        self._closed = False
+        self._read_fd, self._write_fd = os.pipe()
+        self._open_log_file()
+        self._thread = threading.Thread(
+            target=self._reader_loop,
+            name="mcp-stderr-log-drain",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def fileno(self) -> int:
+        return self._write_fd
+
+    def write(self, data: Any) -> int:
+        if isinstance(data, bytes):
+            payload = data
+        else:
+            payload = str(data).encode("utf-8", "replace")
+        self._write_bytes(payload)
+        return len(payload)
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._fh is not None:
+                self._fh.flush()
+
+    def close(self) -> None:
+        """Close the sink; primarily used by tests."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            for fd in (self._write_fd, self._read_fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                except Exception:
+                    pass
+                self._fh = None
+
+    def _rotated_path(self):
+        stamp = time.strftime("%Y%m%d%H%M%S", time.localtime())
+        base = self.log_path.with_name(
+            f"{self.log_path.name}.rotated-{stamp}-{os.getpid()}"
+        )
+        candidate = base
+        idx = 1
+        while candidate.exists():
+            candidate = self.log_path.with_name(f"{base.name}.{idx}")
+            idx += 1
+        return candidate
+
+    def _rotate_active_locked(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
+        try:
+            if self.log_path.exists() and self.log_path.stat().st_size > 0:
+                self.log_path.rename(self._rotated_path())
+        except FileNotFoundError:
+            pass
+
+    def _open_log_file(self) -> None:
+        with self._lock:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if self.log_path.exists() and self.log_path.stat().st_size > self.max_bytes:
+                    self._rotate_active_locked()
+                self._fh = open(self.log_path, "ab", buffering=0)
+            except Exception:
+                if self._fh is not None:
+                    try:
+                        self._fh.close()
+                    except Exception:
+                        pass
+                # Fail closed: if the profile log is unavailable, discard MCP
+                # subprocess stderr instead of spilling it back into the TUI.
+                self._fh = open(os.devnull, "wb", buffering=0)
+
+    def _write_bytes(self, payload: bytes) -> None:
+        if not payload:
+            return
+        with self._lock:
+            if self._closed:
+                return
+            if self._fh is None:
+                self._open_log_file()
+            try:
+                try:
+                    current_size = self.log_path.stat().st_size
+                except OSError:
+                    current_size = 0
+                if current_size and current_size + len(payload) > self.max_bytes:
+                    self._rotate_active_locked()
+                    self._fh = open(self.log_path, "ab", buffering=0)
+                fh = self._fh
+                if fh is None:
+                    return
+                fh.write(payload)
+            except Exception as exc:  # pragma: no cover — best-effort fallback
+                logger.debug("Failed to write MCP stderr log, using devnull: %s", exc)
+                try:
+                    if self._fh is not None:
+                        self._fh.close()
+                except Exception:
+                    pass
+                self._fh = open(os.devnull, "wb", buffering=0)
+                try:
+                    self._fh.write(payload)
+                except Exception:
+                    pass
+
+    def _reader_loop(self) -> None:
+        while True:
+            try:
+                chunk = os.read(self._read_fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            self._write_bytes(chunk)
+
+
 def _get_mcp_stderr_log() -> Any:
-    """Return a shared append-mode file handle for MCP subprocess stderr.
+    """Return a shared bounded fd-backed sink for MCP subprocess stderr.
 
     Opened once per process and reused for every stdio server.  Must have a
     real OS-level file descriptor (``fileno()``) because asyncio's subprocess
     machinery wires the child's stderr directly to that fd.  Falls back to
-    ``/dev/null`` if opening the log file fails.
+    ``/dev/null`` if opening the per-profile log sink fails.
     """
     global _mcp_stderr_log_fh
     with _mcp_stderr_log_lock:
@@ -132,23 +296,14 @@ def _get_mcp_stderr_log() -> Any:
         try:
             from hermes_constants import get_hermes_home
             log_dir = get_hermes_home() / "logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
             log_path = log_dir / "mcp-stderr.log"
-            # Line-buffered so server output lands on disk promptly; errors=
-            # "replace" tolerates garbled binary output from misbehaving
-            # servers.
-            fh = open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
-            # Sanity-check: confirm a real fd is available before we commit.
-            fh.fileno()
-            _mcp_stderr_log_fh = fh
+            _mcp_stderr_log_fh = _McpStderrSink(
+                log_path,
+                max_bytes=_mcp_stderr_max_bytes(),
+            )
         except Exception as exc:  # pragma: no cover — best-effort fallback
             logger.debug("Failed to open MCP stderr log, using devnull: %s", exc)
-            try:
-                _mcp_stderr_log_fh = open(os.devnull, "w", encoding="utf-8")
-            except Exception:
-                # Last resort: the real stderr.  Not ideal for TUI users but
-                # it matches pre-fix behavior.
-                _mcp_stderr_log_fh = sys.stderr
+            _mcp_stderr_log_fh = open(os.devnull, "wb", buffering=0)
         return _mcp_stderr_log_fh
 
 

@@ -637,6 +637,19 @@ class CheckpointManager:
             return False
 
         abs_dir = str(_normalize_path(working_dir))
+        abs_path = Path(abs_dir)
+
+        # File tools may checkpoint a parent directory before creating it,
+        # especially for external config drop-ins such as systemd user unit
+        # overrides.  That is an expected pre-create state, not an operational
+        # error.  Skip quietly and do not mark the path as checkpointed so a
+        # later call can snapshot it after the directory exists.
+        if not abs_path.exists():
+            logger.debug("Checkpoint skipped: working directory not found (%s)", abs_dir)
+            return False
+        if not abs_path.is_dir():
+            logger.debug("Checkpoint skipped: working directory is not a directory (%s)", abs_dir)
+            return False
 
         # Skip root, home, and other overly broad directories
         if abs_dir in {"/", str(Path.home())}:
