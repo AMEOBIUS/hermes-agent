@@ -174,3 +174,37 @@ def test_service_status_includes_clients(mock_pyright):
         assert any(c["server_id"] == "pyright" for c in info["clients"])
     finally:
         svc.shutdown()
+
+
+def test_service_skips_oversized_files_before_spawning(mock_pyright, monkeypatch):
+    """Very large files should bypass LSP before spawn/initialize.
+
+    This prevents repeated pyright timeout/spawn warning noise on monolith
+    modules while preserving normal LSP checks for ordinary files.
+    """
+    repo = mock_pyright
+    f = repo / "huge.py"
+    f.write_text("x = 1\n" * 128)
+    seen = []
+    monkeypatch.setattr(
+        "agent.lsp.eventlog.log_size_skipped",
+        lambda server_id, path, size, limit: seen.append((server_id, path, size, limit)),
+    )
+
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=3.0,
+        install_strategy="manual",
+        max_file_size_bytes=8,
+    )
+    try:
+        assert svc.enabled_for(str(f))
+        svc.snapshot_baseline(str(f))
+        assert svc.get_diagnostics_sync(str(f)) == []
+        assert svc._clients == {}
+        assert seen
+        assert all(item[0] == "pyright" for item in seen)
+        assert all(item[2] > item[3] for item in seen)
+    finally:
+        svc.shutdown()

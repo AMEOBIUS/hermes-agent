@@ -108,6 +108,20 @@ def log_disabled(server_id: str, file_path: str, reason: str) -> None:
     _emit(server_id, logging.DEBUG, f"skipped: {reason} ({_short_path(file_path)})")
 
 
+def log_size_skipped(server_id: str, file_path: str, size_bytes: int, limit_bytes: int) -> None:
+    """LSP intentionally skipped a very large file. DEBUG by default.
+
+    Large monolith modules can exceed per-edit diagnostic budgets and cause
+    repeated language-server timeout/spawn warnings. This is an intentional
+    preflight skip, not a server failure.
+    """
+    _emit(
+        server_id,
+        logging.DEBUG,
+        f"skipped: file too large {size_bytes}>{limit_bytes} bytes ({_short_path(file_path)})",
+    )
+
+
 def log_active(server_id: str, workspace_root: str) -> None:
     """A new LSP client started for (server_id, workspace_root).
 
@@ -201,6 +215,7 @@ __all__ = [
     "event_log",
     "log_clean",
     "log_disabled",
+    "log_size_skipped",
     "log_active",
     "log_diagnostics",
     "log_no_project_root",

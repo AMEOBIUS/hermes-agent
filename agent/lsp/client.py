@@ -164,6 +164,15 @@ class LSPClient:
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._reader_task: Optional[asyncio.Task] = None
+        # asyncio StreamWriter.drain() is not safe to await concurrently on
+        # the same writer: FlowControlMixin asserts a single drain waiter.
+        # Server→client requests are dispatched concurrently, so serialize all
+        # stdin write+drain pairs through this lock.
+        self._write_lock = asyncio.Lock()
+        # Retain fire-and-forget server→client request tasks and always
+        # consume their exceptions. Otherwise a best-effort reply failure can
+        # surface as noisy "Task exception was never retrieved" log spam.
+        self._dispatch_tasks: Set[asyncio.Task] = set()
 
         # Request/response correlation
         self._next_id: int = 0
@@ -310,7 +319,9 @@ class LSPClient:
                 if kind == "response":
                     self._dispatch_response(key, msg)
                 elif kind == "request":
-                    asyncio.create_task(self._dispatch_request(key, msg))
+                    task = asyncio.create_task(self._dispatch_request(key, msg))
+                    self._dispatch_tasks.add(task)
+                    task.add_done_callback(self._on_dispatch_done)
                 elif kind == "notification":
                     self._dispatch_notification(key, msg)
                 else:
@@ -325,6 +336,23 @@ class LSPClient:
                 if not fut.done():
                     fut.set_exception(LSPProtocolError("server connection closed"))
             self._pending.clear()
+
+    def _on_dispatch_done(self, task: asyncio.Task) -> None:
+        """Consume fire-and-forget request task failures.
+
+        The LSP reader loop intentionally does not await server→client request
+        handlers inline — a language server can send several requests while a
+        normal client request is waiting. The cost of that concurrency is that
+        every task needs an observer. Keep real failures visible at DEBUG but
+        never let asyncio emit an unstructured ERROR for an unretrieved task.
+        """
+        self._dispatch_tasks.discard(task)
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            logger.debug("[%s] dispatch task failed: %s", self.server_id, exc)
 
     async def _initialize(self) -> None:
         params = {
@@ -436,6 +464,13 @@ class LSPClient:
                 await self._stderr_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        if self._dispatch_tasks:
+            tasks = list(self._dispatch_tasks)
+            self._dispatch_tasks.clear()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
         proc = self._proc
         self._proc = None
         if proc is None:
@@ -458,6 +493,33 @@ class LSPClient:
     # request / notification plumbing
     # ------------------------------------------------------------------
 
+    async def _write_stdin(self, data: bytes, *, label: str, raise_on_error: bool = False) -> bool:
+        """Best-effort serialized write to the LSP server stdin.
+
+        ``StreamWriter.drain()`` can raise an internal ``AssertionError`` when
+        multiple coroutines await it concurrently. Treat that like a transport
+        write failure: requests may opt into ``LSPProtocolError`` while
+        notifications/responses stay best-effort and return ``False``.
+        """
+        if self._proc is None or self._proc.stdin is None or self._proc.stdin.is_closing():
+            if raise_on_error:
+                raise LSPProtocolError(f"cannot send {label!r}: stdin closed")
+            return False
+        try:
+            async with self._write_lock:
+                if self._proc is None or self._proc.stdin is None or self._proc.stdin.is_closing():
+                    if raise_on_error:
+                        raise LSPProtocolError(f"cannot send {label!r}: stdin closed")
+                    return False
+                self._proc.stdin.write(data)
+                await self._proc.stdin.drain()
+                return True
+        except (BrokenPipeError, ConnectionResetError, OSError, AssertionError) as e:
+            if raise_on_error:
+                raise LSPProtocolError(f"send failed for {label!r}: {e}") from e
+            logger.debug("[%s] send %s failed: %s", self.server_id, label, e)
+            return False
+
     async def _send_request(self, method: str, params: Any) -> Any:
         if self._proc is None or self._proc.stdin is None or self._proc.stdin.is_closing():
             raise LSPProtocolError(f"cannot send {method!r}: stdin closed")
@@ -467,11 +529,14 @@ class LSPClient:
         fut: asyncio.Future = loop.create_future()
         self._pending[req_id] = fut
         try:
-            self._proc.stdin.write(encode_message(make_request(req_id, method, params)))
-            await self._proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            await self._write_stdin(
+                encode_message(make_request(req_id, method, params)),
+                label=method,
+                raise_on_error=True,
+            )
+        except LSPProtocolError:
             self._pending.pop(req_id, None)
-            raise LSPProtocolError(f"send failed for {method!r}: {e}") from e
+            raise
         try:
             return await fut
         finally:
@@ -494,31 +559,22 @@ class LSPClient:
                 raise
 
     async def _send_notification(self, method: str, params: Any) -> None:
-        if self._proc is None or self._proc.stdin is None or self._proc.stdin.is_closing():
-            return
-        try:
-            self._proc.stdin.write(encode_message(make_notification(method, params)))
-            await self._proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError, OSError) as e:
-            logger.debug("[%s] notify %s failed: %s", self.server_id, method, e)
+        await self._write_stdin(
+            encode_message(make_notification(method, params)),
+            label=f"notify {method}",
+        )
 
     async def _send_response(self, req_id: Any, result: Any) -> None:
-        if self._proc is None or self._proc.stdin is None or self._proc.stdin.is_closing():
-            return
-        try:
-            self._proc.stdin.write(encode_message(make_response(req_id, result)))
-            await self._proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
+        await self._write_stdin(
+            encode_message(make_response(req_id, result)),
+            label=f"response {req_id}",
+        )
 
     async def _send_error_response(self, req_id: Any, code: int, message: str) -> None:
-        if self._proc is None or self._proc.stdin is None or self._proc.stdin.is_closing():
-            return
-        try:
-            self._proc.stdin.write(encode_message(make_error_response(req_id, code, message)))
-            await self._proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
+        await self._write_stdin(
+            encode_message(make_error_response(req_id, code, message)),
+            label=f"error response {req_id}",
+        )
 
     def _dispatch_response(self, req_id: int, msg: dict) -> None:
         fut = self._pending.get(req_id)

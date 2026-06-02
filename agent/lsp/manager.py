@@ -59,6 +59,7 @@ from agent.lsp.workspace import (
 logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
+DEFAULT_MAX_FILE_SIZE_BYTES = 512 * 1024
 
 
 class _BackgroundLoop:
@@ -155,6 +156,7 @@ class LSPService:
         init_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
         disabled_servers: Optional[List[str]] = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES,
     ) -> None:
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
@@ -165,6 +167,7 @@ class LSPService:
         self._init_overrides = init_overrides or {}
         self._disabled_servers = set(disabled_servers or [])
         self._idle_timeout = idle_timeout
+        self._max_file_size_bytes = max(0, int(max_file_size_bytes))
 
         self._loop = _BackgroundLoop()
         if self._enabled:
@@ -205,6 +208,9 @@ class LSPService:
         wait_mode = lsp_cfg.get("wait_mode", "document")
         wait_timeout = float(lsp_cfg.get("wait_timeout", DIAGNOSTICS_DOCUMENT_WAIT))
         install_strategy = lsp_cfg.get("install_strategy", "auto")
+        max_file_size_bytes = int(
+            lsp_cfg.get("max_file_size_bytes", DEFAULT_MAX_FILE_SIZE_BYTES)
+        )
         servers_cfg = lsp_cfg.get("servers") or {}
         disabled = []
         binary_overrides: Dict[str, List[str]] = {}
@@ -235,6 +241,7 @@ class LSPService:
             env_overrides=env_overrides,
             init_overrides=init_overrides,
             disabled_servers=disabled,
+            max_file_size_bytes=max_file_size_bytes,
         )
 
     # ------------------------------------------------------------------
@@ -291,6 +298,8 @@ class LSPService:
         """
         if not self.enabled_for(file_path):
             return
+        if self._skip_large_file(file_path):
+            return
         try:
             diags = self._loop.run(self._snapshot_async(file_path), timeout=8.0)
             self._delta_baseline[os.path.abspath(file_path)] = diags or []
@@ -338,6 +347,8 @@ class LSPService:
         # when the request errors out below.
         srv = find_server_for_file(file_path)
         server_id = srv.server_id if srv else "?"
+        if self._skip_large_file(file_path, srv=srv):
+            return []
 
         try:
             t = timeout if timeout is not None else self._wait_timeout + 2.0
@@ -430,6 +441,23 @@ class LSPService:
 
         if not already_broken:
             eventlog.log_spawn_failed(srv.server_id, per_server_root, exc)
+
+    def _skip_large_file(self, file_path: str, *, srv=None) -> bool:
+        """Return True when LSP should intentionally skip an oversized file."""
+        limit = self._max_file_size_bytes
+        if limit <= 0:
+            return False
+        try:
+            size = os.path.getsize(file_path)
+        except OSError:
+            return False
+        if size <= limit:
+            return False
+        if srv is None:
+            srv = find_server_for_file(file_path)
+        if srv is not None:
+            eventlog.log_size_skipped(srv.server_id, file_path, size, limit)
+        return True
 
     def shutdown(self) -> None:
         """Tear down all clients and stop the background loop."""
