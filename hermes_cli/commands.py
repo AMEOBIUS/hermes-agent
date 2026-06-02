@@ -865,16 +865,16 @@ def discord_skill_commands_by_category(
     in PR #11580) flattens these results and feeds them into a single
     autocomplete callback, which scales to thousands of entries without any
     per-command payload concerns. ``hidden_count`` is retained in the return
-    tuple for backward compatibility and still reports skills dropped for
-    other reasons (32-char clamp collision vs a reserved name).
+    tuple for backward compatibility and reports skills still dropped after
+    safe aliasing (reserved-name collisions or exhausted 32-char alias slots).
 
     Returns:
         ``(categories, uncategorized, hidden_count)``
 
         - *categories*: ``{category_name: [(name, description, cmd_key), ...]}``
         - *uncategorized*: ``[(name, description, cmd_key), ...]``
-        - *hidden_count*: skills dropped due to name clamp collisions
-          against already-registered command names.
+        - *hidden_count*: skills dropped because they could not be safely
+          surfaced in autocomplete.
     """
     from pathlib import Path as _P
 
@@ -888,11 +888,12 @@ def discord_skill_commands_by_category(
     # Collect raw skill data --------------------------------------------------
     categories: dict[str, list[tuple[str, str, str]]] = {}
     uncategorized: list[tuple[str, str, str]] = []
-    # Map clamped-32-char-name → what it came from, so we can emit an
-    # actionable warning on collision. Reserved (gateway-builtin) command
-    # names are marked with a sentinel so the warning distinguishes
-    # "skill collided with a reserved command" from "two skills collided
-    # on the 32-char clamp" — the latter is the rename-worthy case.
+    # Map Discord autocomplete name → what it came from. Reserved
+    # (gateway-builtin) command names are marked with a sentinel so skills
+    # never shadow built-ins. Skill-vs-skill 32-char collisions are resolved
+    # by deterministic suffix aliases instead of dropping the second skill:
+    # the displayed value stays <=32 chars while the full cmd_key is preserved
+    # for dispatch.
     _names_used: dict[str, str] = dict.fromkeys(reserved_names, "<reserved>")
     hidden = 0
 
@@ -945,20 +946,11 @@ def discord_skill_commands_by_category(
                 continue
 
             raw_name = cmd_key.lstrip("/")
-            # Clamp to 32 chars (Discord per-command name limit)
+            # Clamp to 32 chars for the visible autocomplete value. Keep the
+            # full cmd_key below for dispatch so aliases never change the
+            # underlying /skill-name that runs.
             discord_name = raw_name[:32]
             if discord_name in _names_used:
-                # Two skills whose first 32 chars are identical. One wins
-                # (the first one seen, which is alphabetical because the
-                # caller iterates ``sorted(skill_cmds)``); the other is
-                # dropped from Discord's /skill autocomplete.
-                #
-                # Silently counting this as ``hidden`` (the old behavior)
-                # meant skill authors had no way to discover the drop —
-                # their skill just didn't appear in the picker. Emit a
-                # WARNING naming both sides so the author can rename the
-                # losing skill's frontmatter name to something with a
-                # distinct 32-char prefix.
                 prior = _names_used[discord_name]
                 if prior == "<reserved>":
                     logger.warning(
@@ -969,17 +961,34 @@ def discord_skill_commands_by_category(
                         "in its first 32 chars.",
                         discord_name, cmd_key, discord_name,
                     )
+                    hidden += 1
+                    continue
+
+                # Two skills whose first 32 chars are identical. This is only
+                # a Discord autocomplete-value collision: the callback can
+                # still dispatch by the preserved full cmd_key. Keep both
+                # skills visible by assigning later entries a deterministic
+                # 31-char-prefix + digit alias (same strategy as the flat
+                # command clamping helper), rather than warning on every
+                # gateway restart and dropping the skill.
+                alias_prefix = raw_name[:31]
+                for digit in range(10):
+                    candidate = f"{alias_prefix}{digit}"
+                    if candidate not in _names_used:
+                        discord_name = candidate
+                        break
                 else:
                     logger.warning(
-                        "Discord /skill: %r and %r both clamp to %r on "
-                        "Discord's 32-char command-name limit — only %r "
-                        "will appear in the /skill autocomplete. Rename "
-                        "one skill's frontmatter ``name:`` to differ in "
-                        "its first 32 chars.",
-                        prior, cmd_key, discord_name, prior,
+                        "Discord /skill: %r collides with %r on Discord's "
+                        "32-char autocomplete name limit and all numeric "
+                        "alias slots for prefix %r are already used — the "
+                        "skill will not appear in the /skill autocomplete. "
+                        "Rename one skill's frontmatter ``name:`` to differ "
+                        "earlier in its first 31 chars.",
+                        cmd_key, prior, alias_prefix,
                     )
-                hidden += 1
-                continue
+                    hidden += 1
+                    continue
             _names_used[discord_name] = cmd_key
 
             desc = info.get("description", "")

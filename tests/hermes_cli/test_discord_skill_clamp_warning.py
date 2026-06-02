@@ -1,16 +1,11 @@
-"""Tests for Discord /skill 32-char clamp collision warnings.
+"""Tests for Discord /skill 32-char clamp collision handling.
 
-Discord's per-command name limit is 32 chars, so
-``discord_skill_commands_by_category`` clamps skill slugs to that width
-before deduping. When two skills share the same 32-char prefix, only
-the first (alphabetical) wins; the second is dropped. Previously the
-drop was silent — the ``hidden`` count incremented but nothing named
-which skills collided, so authors had no way to discover the drop
-short of noticing that their skill was missing from the autocomplete.
-
-This module pins the upgraded behavior: a WARNING log with both full
-cmd_keys + the clamped name, so whoever named the skills sees the
-collision and can rename one.
+Discord's autocomplete values are capped at 32 chars, so
+``discord_skill_commands_by_category`` clamps skill slugs to that width.
+When two skills share the same 32-char prefix, both should still be usable:
+the later skill gets a deterministic short alias while the original cmd_key
+is preserved for dispatch. True drops are reserved-name collisions or the
+pathological case where all numeric alias slots are exhausted.
 """
 from __future__ import annotations
 
@@ -19,15 +14,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-def test_clamp_collision_emits_warning_naming_both_skills(
+def test_clamp_collision_assigns_alias_and_preserves_both_cmd_keys(
     tmp_path: Path, caplog
 ) -> None:
-    """Two skills with identical first 32 chars — warning names both."""
+    """Two skills with identical first 32 chars both appear via aliases."""
     from hermes_cli.commands import discord_skill_commands_by_category
 
     # Craft cmd_keys that share the first 32 chars.
-    # 40-char prefix 'skill-collision-prefix-identical-first-32'
-    #   -> clamped to 'skill-collision-prefix-identical'
     prefix = "skill-collision-prefix-identical"  # exactly 32 chars
     name_a = prefix + "-alpha"  # /skill-collision-prefix-identical-alpha
     name_b = prefix + "-bravo"  # /skill-collision-prefix-identical-bravo
@@ -59,26 +52,23 @@ def test_clamp_collision_emits_warning_naming_both_skills(
             reserved_names=set(),
         )
 
-    # One skill made it through, one was dropped (hidden counted).
-    assert hidden == 1
-    kept_names = [n for n, _d, _k in categories.get("creative", [])]
-    assert len(kept_names) == 1
-    # Alphabetical iteration means the -alpha variant wins the slot.
-    assert kept_names[0] == prefix  # clamped
+    assert hidden == 0
+    assert uncategorized == []
+    entries = categories.get("creative", [])
+    assert len(entries) == 2
 
-    # Exactly one warning, naming BOTH full cmd_keys and the clamped name.
+    by_key = {cmd_key: name for name, _desc, cmd_key in entries}
+    assert by_key[f"/{name_a}"] == prefix
+    # The second entry keeps a <=32-char deterministic alias and still points
+    # at the full cmd_key used by the Discord /skill callback.
+    assert by_key[f"/{name_b}"] == prefix[:-1] + "0"
+    assert len(by_key[f"/{name_b}"]) == 32
+
     warnings = [
         r for r in caplog.records
         if r.levelno == logging.WARNING and "clamp" in r.getMessage()
     ]
-    assert len(warnings) == 1, (
-        f"expected exactly one clamp-collision warning, got {len(warnings)}: "
-        f"{[r.getMessage() for r in warnings]}"
-    )
-    msg = warnings[0].getMessage()
-    assert f"/{name_a}" in msg, f"winner not named in warning: {msg!r}"
-    assert f"/{name_b}" in msg, f"loser not named in warning: {msg!r}"
-    assert prefix in msg, f"clamped name not in warning: {msg!r}"
+    assert warnings == []
 
 
 def test_clamp_collision_with_reserved_name_emits_distinct_warning(
@@ -86,9 +76,8 @@ def test_clamp_collision_with_reserved_name_emits_distinct_warning(
 ) -> None:
     """A skill clashing with a reserved gateway command gets its own phrasing.
 
-    The reserved-vs-skill case is operationally different — the fix is
-    still "rename the skill," but there's no second skill to also
-    rename. The warning should say so explicitly.
+    The reserved-vs-skill case cannot be alias-resolved because the reserved
+    command name already belongs to a built-in gateway slash command.
     """
     from hermes_cli.commands import discord_skill_commands_by_category
 
@@ -244,3 +233,55 @@ def test_long_skill_name_preserves_cmd_key_through_by_category(
     short_entry = [e for e in entries if e[2] == "/short-skill"]
     assert len(short_entry) == 1
     assert short_entry[0][0] == "short-skill"
+
+
+def test_clamp_collision_exhausted_alias_slots_warns_and_hides(
+    tmp_path: Path, caplog
+) -> None:
+    """If all ten numeric aliases are taken, the next collision is hidden."""
+    from hermes_cli.commands import discord_skill_commands_by_category
+
+    base31 = "skill-collision-prefix-identica"  # exactly 31 chars
+    assert len(base31) == 31
+    primary = base31 + "l-alpha"
+    # Numeric alias candidates for the primary's collision prefix.
+    preseeded = [base31 + str(i) for i in range(10)]
+    loser = base31 + "l-bravo"
+
+    skills_dir = tmp_path / "skills"
+    names = [primary, *preseeded, loser]
+    for nm in names:
+        d = skills_dir / "creative" / nm
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text("---\nname: x\n---\n")
+
+    fake_cmds = {
+        f"/{nm}": {
+            "name": nm,
+            "description": nm,
+            "skill_md_path": str(skills_dir / "creative" / nm / "SKILL.md"),
+        }
+        for nm in names
+    }
+
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.commands"), (
+        patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds)
+    ), patch("tools.skills_tool.SKILLS_DIR", skills_dir):
+        categories, uncategorized, hidden = discord_skill_commands_by_category(
+            reserved_names=set(),
+        )
+
+    assert hidden == 1
+    entries = categories.get("creative", [])
+    by_key = {cmd_key: name for name, _desc, cmd_key in entries}
+    assert f"/{loser}" not in by_key
+    assert f"/{primary}" in by_key
+    for nm in preseeded:
+        assert by_key[f"/{nm}"] == nm
+
+    warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "alias slots" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert f"/{loser}" in warnings[0].getMessage()

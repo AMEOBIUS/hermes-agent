@@ -28,6 +28,9 @@ actionable guidance the model can relay to the user.
 import json
 import logging
 import os
+import socket
+import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -55,23 +58,29 @@ def _get_bot_token() -> Optional[str]:
     return os.getenv("DISCORD_BOT_TOKEN", "").strip() or None
 
 
-def _discord_request(
-    method: str,
-    path: str,
-    token: str,
-    params: Optional[Dict[str, str]] = None,
-    body: Optional[Dict[str, Any]] = None,
-    timeout: int = 15,
-) -> Any:
-    """Make a request to the Discord REST API."""
-    url = f"{DISCORD_API_BASE}{path}"
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
+def _discord_proxies() -> list:
+    """SOCKS/HTTP proxy fallback chain, mirroring the poster/heartbeat scripts.
 
-    data = None
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
+    Order: explicit Discord proxy env → generic ALL_PROXY → known-good default
+    (Xray SOCKS at 127.0.0.1:1080) → direct. ``socks5h`` keeps DNS on the proxy
+    side, which is what works in this WSL setup.
+    """
+    raw = (
+        os.environ.get("HERMES_DISCORD_PROXY")
+        or os.environ.get("DISCORD_PROXY")
+        or os.environ.get("ALL_PROXY")
+        or os.environ.get("all_proxy")
+        or "socks5h://127.0.0.1:1080"
+    )
+    out: list = []
+    for p in (raw, None):  # proxy first, then direct as last resort
+        if p not in out:
+            out.append(p)
+    return out
 
+
+def _discord_native(method: str, url: str, token: str, data, timeout: int) -> Any:
+    """Direct urllib call to discord.com. Fast path; can stall on TLS flaps."""
     req = urllib.request.Request(
         url,
         data=data,
@@ -82,19 +91,121 @@ def _discord_request(
             "User-Agent": "Hermes-Agent (https://github.com/NousResearch/hermes-agent)",
         },
     )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        if resp.status == 204:
+            return None
+        raw = resp.read().decode("utf-8")
+        return json.loads(raw) if raw else None
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status == 204:
-                return None
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        error_body = ""
+
+def _discord_curl(method: str, url: str, token: str, data, timeout: int) -> Any:
+    """Fallback transport via curl over the SOCKS proxy chain.
+
+    Used when the native direct TLS path fails (SSL handshake timeout, etc.).
+    Mirrors the proven curl mechanics in gitdb_tools_poster.py. Returns parsed
+    JSON / None, or raises DiscordAPIError for real >=400 API responses.
+    """
+    last_exc: Optional[Exception] = None
+    for proxy in _discord_proxies():
+        cmd = ["curl", "-sS", "--connect-timeout", "10", "--max-time", str(timeout + 10),
+               "-X", method, "-w", "\n<<<HTTP:%{http_code}>>>"]
+        if proxy:
+            cmd += ["-x", proxy]
+        cmd += ["-H", f"Authorization: Bot {token}",
+                "-H", "Content-Type: application/json",
+                "-H", "User-Agent: Hermes-Agent (https://github.com/NousResearch/hermes-agent)"]
+        if data is not None:
+            cmd += ["--data-binary", data.decode("utf-8") if isinstance(data, bytes) else data]
+        cmd.append(url)
         try:
-            error_body = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            pass
-        raise DiscordAPIError(e.code, error_body) from e
+            r = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout + 20)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            continue
+        out = r.stdout or ""
+        marker = out.rfind("<<<HTTP:")
+        status = 0
+        if marker != -1:
+            try:
+                status = int(out[marker + 8:].split(">>>")[0])
+            except ValueError:
+                status = 0
+            body = out[:marker].rstrip("\n")
+        else:
+            body = out
+        if r.returncode != 0 and status == 0:
+            last_exc = RuntimeError(f"curl via {proxy or 'direct'} rc={r.returncode}: {r.stderr[:200]}")
+            continue
+        if status == 204 or not body:
+            return None
+        if status >= 400:
+            raise DiscordAPIError(status, body)
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            return body
+    raise last_exc or RuntimeError("discord curl fallback exhausted")
+
+
+def _discord_request(
+    method: str,
+    path: str,
+    token: str,
+    params: Optional[Dict[str, str]] = None,
+    body: Optional[Dict[str, Any]] = None,
+    timeout: int = 15,
+    max_attempts: int = 3,
+) -> Any:
+    """Make a request to the Discord REST API with retry + proxy fallback.
+
+    A single network flap to discord.com (TLS handshake timeout) used to fail
+    the whole tool call and surface a scary raw URLError. Now: native fast path,
+    and on a *transport* failure we immediately try curl-over-SOCKS, retrying
+    with exponential backoff. Real API responses (4xx) are NOT retried; only
+    transient transport errors and 429/5xx are.
+    """
+    url = f"{DISCORD_API_BASE}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+
+    transient = (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError)
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_attempts):
+        try:
+            return _discord_native(method, url, token, data, timeout)
+        except urllib.error.HTTPError as e:
+            error_body = ""
+            try:
+                error_body = e.read().decode("utf-8", errors="replace")
+            except Exception:  # noqa: BLE001
+                pass
+            # Retry only on rate-limit / server-side errors; client errors are final.
+            if e.code == 429 or 500 <= e.code < 600:
+                last_exc = DiscordAPIError(e.code, error_body)
+                time.sleep(min(0.5 * (2 ** attempt), 6.0))
+                continue
+            raise DiscordAPIError(e.code, error_body) from e
+        except transient as e:
+            # Native direct path stalled (e.g. SSL handshake timeout). Try curl
+            # over the SOCKS chain right away before giving up this attempt.
+            last_exc = e
+            logger.warning("Discord native request failed (%s); trying proxy fallback", type(e).__name__)
+            try:
+                return _discord_curl(method, url, token, data, timeout)
+            except DiscordAPIError as ce:
+                if ce.status == 429 or 500 <= ce.status < 600:
+                    last_exc = ce
+                    time.sleep(min(0.5 * (2 ** attempt), 6.0))
+                    continue
+                raise
+            except Exception as ce:  # noqa: BLE001
+                last_exc = ce
+                time.sleep(min(0.5 * (2 ** attempt), 6.0))
+                continue
+    if isinstance(last_exc, DiscordAPIError):
+        raise last_exc
+    raise DiscordAPIError(0, f"Discord request failed after {max_attempts} attempts: {last_exc}")
 
 
 class DiscordAPIError(Exception):

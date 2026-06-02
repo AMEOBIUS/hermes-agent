@@ -2361,6 +2361,8 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
 Description={SERVICE_DESCRIPTION}
 After=network-online.target
 Wants=network-online.target
+ConditionPathExists={python_path}
+ConditionPathExists={working_dir}
 StartLimitIntervalSec=0
 
 [Service]
@@ -2377,11 +2379,9 @@ Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
 Restart=always
 RestartSec=5
-RestartMaxDelaySec=300
-RestartSteps=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
 KillMode=mixed
-KillSignal=SIGTERM
+KillSignal=SIGINT
 ExecReload=/bin/kill -USR1 $MAINPID
 TimeoutStopSec={restart_timeout}
 StandardOutput=journal
@@ -2401,6 +2401,8 @@ WantedBy=multi-user.target
 Description={SERVICE_DESCRIPTION}
 After=network-online.target
 Wants=network-online.target
+ConditionPathExists={python_path}
+ConditionPathExists={working_dir}
 StartLimitIntervalSec=0
 
 [Service]
@@ -2412,11 +2414,9 @@ Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
 Restart=always
 RestartSec=5
-RestartMaxDelaySec=300
-RestartSteps=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
 KillMode=mixed
-KillSignal=SIGTERM
+KillSignal=SIGINT
 ExecReload=/bin/kill -USR1 $MAINPID
 TimeoutStopSec={restart_timeout}
 StandardOutput=journal

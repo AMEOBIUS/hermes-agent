@@ -348,5 +348,6 @@ When the orchestration involves significant context usage, long review loops, or
 
 - **`references/context-budget-discipline.md`** — Four-tier context degradation model (PEAK / GOOD / DEGRADING / POOR), read-depth rules that scale with context window size, and early warning signs of silent degradation. Load when a run will clearly consume significant context (multi-phase plans, many subagents, large artifacts).
 - **`references/gates-taxonomy.md`** — The four canonical gate types (Pre-flight, Revision, Escalation, Abort) with behavior, recovery, and examples. Load when designing or reviewing any workflow that has validation checkpoints — use the vocabulary explicitly so each gate has defined entry, failure behavior, and resumption rules.
+- **`references/live-bd-subagent-test.md`** — Recipe for testing delegation on real Beads (`bd`) issues with 2-3 independent read-only/test/triage lanes, sanitized packets, and mandatory parent verification. Load when the user asks to test subagents on live bd tasks or validate delegation behavior.
 
-Both references adapted from gsd-build/get-shit-done (MIT © 2025 Lex Christopherson).
+Both gsd references adapted from gsd-build/get-shit-done (MIT © 2025 Lex Christopherson).

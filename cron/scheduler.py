@@ -235,6 +235,44 @@ def _get_lock_paths() -> tuple[Path, Path]:
     return lock_dir, lock_dir / ".tick.lock"
 
 
+def _profile_root_env_fallback(hermes_home: Path) -> Path | None:
+    """Return the root .hermes/.env fallback for profile-scoped jobs.
+
+    Profile homes live under ``<root>/.hermes/profiles/<name>``.  Many
+    deployments keep shared platform credentials (Discord/Telegram/etc.) in
+    the root ``.hermes/.env`` and point gateway systemd at that file.  A
+    standalone cron tick that runs a job under ``profile=...`` does not inherit
+    the systemd EnvironmentFile, so profile job delivery must explicitly load
+    the root env as a non-overriding fallback.
+    """
+    try:
+        resolved = hermes_home.resolve()
+    except Exception:
+        resolved = hermes_home
+    if resolved.parent.name != "profiles":
+        return None
+    root_env = resolved.parent.parent / ".env"
+    return root_env if root_env.exists() else None
+
+
+def _load_job_dotenv_for_current_home() -> None:
+    """Load env for the active scheduler/profile home plus root fallback.
+
+    ``run_job()`` temporarily points ``_get_hermes_home()`` at a per-job
+    profile and restores ``os.environ`` on exit.  Delivery happens after the
+    agent/script returns, so it needs the same env load while the profile
+    context is active; otherwise standalone Discord delivery can fail with
+    ``DISCORD_BOT_TOKEN is not set`` even though the gateway itself is healthy.
+    """
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    hermes_home = _get_hermes_home()
+    load_hermes_dotenv(
+        hermes_home=hermes_home,
+        project_env=_profile_root_env_fallback(hermes_home),
+    )
+
+
 @contextmanager
 def _job_profile_context(job_id: str, profile: Optional[str]):
     """Temporarily run a job under a specific Hermes profile.
@@ -1638,12 +1676,10 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
     try:
         # Re-read .env and config.yaml fresh every run so provider/key
-        # changes take effect without a gateway restart.
-        from dotenv import load_dotenv
-        try:
-            load_dotenv(str(_get_hermes_home() / ".env"), override=True, encoding="utf-8")
-        except UnicodeDecodeError:
-            load_dotenv(str(_get_hermes_home() / ".env"), override=True, encoding="latin-1")
+        # changes take effect without a gateway restart.  Use the shared
+        # loader so profile-scoped jobs also get the root .hermes/.env fallback
+        # used by the gateway systemd unit for shared platform credentials.
+        _load_job_dotenv_for_current_home()
 
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
@@ -2134,7 +2170,14 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 delivery_error = None
                 if should_deliver:
                     try:
-                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                        # run_job() intentionally restores the profile env on
+                        # return.  Re-enter just for delivery so standalone
+                        # platform sends see profile/root .env credentials,
+                        # while output persistence and mark_job_run still write
+                        # to the scheduler's canonical cron store.
+                        with _job_profile_context(job["id"], job.get("profile")):
+                            _load_job_dotenv_for_current_home()
+                            delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
                     except Exception as de:
                         delivery_error = str(de)
                         logger.error("Delivery failed for job %s: %s", job["id"], de)

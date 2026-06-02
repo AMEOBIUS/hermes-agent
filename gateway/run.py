@@ -20124,28 +20124,33 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM/SIGINT",
             )
 
-        # Always log who/what triggered the signal — most useful single
-        # line when diagnosing "the gateway keeps dying" tickets.  Format
-        # is one line, key=value, parent_cmdline last (often long).
+        # Log who/what triggered the signal — most useful single line when
+        # diagnosing "the gateway keeps dying" tickets. Planned stops are
+        # expected lifecycle events (e.g. systemd restart with KillSignal=SIGINT),
+        # so keep them at INFO to avoid warning-probe noise. Unexpected signals
+        # stay WARNING and still get the heavyweight diagnostic.
         if _shutdown_ctx is not None:
             try:
-                logger.warning(
-                    "Shutdown context: %s", format_context_for_log(_shutdown_ctx)
-                )
+                shutdown_context_msg = format_context_for_log(_shutdown_ctx)
+                if planned_takeover or planned_stop:
+                    logger.info("Shutdown context: %s", shutdown_context_msg)
+                else:
+                    logger.warning("Shutdown context: %s", shutdown_context_msg)
             except Exception as _e:
                 logger.debug("format_context_for_log failed: %s", _e)
 
-            # Spawn the heavyweight diagnostic (ps auxf, pstree, dmesg) in
-            # a detached subprocess so it can finish writing to disk even
-            # if our cgroup is being torn down.  Bounded by an internal
-            # timeout; never blocks the event loop here.
-            try:
-                _diag_log = _hermes_home / "logs" / "gateway-shutdown-diag.log"
-                spawn_async_diagnostic(
-                    _diag_log, _shutdown_ctx["signal"], timeout_seconds=5.0
-                )
-            except Exception as _e:
-                logger.debug("spawn_async_diagnostic failed: %s", _e)
+            if not (planned_takeover or planned_stop):
+                # Spawn the heavyweight diagnostic (ps auxf, pstree, dmesg) in
+                # a detached subprocess so it can finish writing to disk even
+                # if our cgroup is being torn down.  Bounded by an internal
+                # timeout; never blocks the event loop here.
+                try:
+                    _diag_log = _hermes_home / "logs" / "gateway-shutdown-diag.log"
+                    spawn_async_diagnostic(
+                        _diag_log, _shutdown_ctx["signal"], timeout_seconds=5.0
+                    )
+                except Exception as _e:
+                    logger.debug("spawn_async_diagnostic failed: %s", _e)
         asyncio.create_task(runner.stop())
 
     def restart_signal_handler():

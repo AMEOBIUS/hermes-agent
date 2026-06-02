@@ -328,6 +328,14 @@ class TestGeneratedSystemdUnits:
         assert "ExecStop=" not in unit
         assert "ExecReload=/bin/kill -USR1 $MAINPID" in unit
         assert f"RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}" in unit
+        # systemd < 254 rejects RestartMaxDelaySec/RestartSteps; keep units portable
+        # and let RestartSec + gateway restart paths handle backoff semantics.
+        assert "RestartMaxDelaySec=" not in unit
+        assert "RestartSteps=" not in unit
+        # systemd stop sends SIGINT so the gateway follows its planned-stop path
+        # (exit 0) while unexpected external SIGTERM remains a failure signal.
+        assert "KillSignal=SIGINT" in unit
+        assert "ConditionPathExists=" in unit
         # TimeoutStopSec must exceed the default drain_timeout (60s) so
         # systemd doesn't SIGKILL the cgroup before post-interrupt cleanup
         # (tool subprocess kill, adapter disconnect) runs — issue #8202.
@@ -389,6 +397,10 @@ class TestGeneratedSystemdUnits:
         assert "ExecStop=" not in unit
         assert "ExecReload=/bin/kill -USR1 $MAINPID" in unit
         assert f"RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}" in unit
+        assert "RestartMaxDelaySec=" not in unit
+        assert "RestartSteps=" not in unit
+        assert "KillSignal=SIGINT" in unit
+        assert "ConditionPathExists=" in unit
         # TimeoutStopSec must exceed the default drain_timeout (60s) so
         # systemd doesn't SIGKILL the cgroup before post-interrupt cleanup
         # (tool subprocess kill, adapter disconnect) runs — issue #8202.

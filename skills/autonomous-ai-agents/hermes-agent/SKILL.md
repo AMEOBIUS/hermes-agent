@@ -661,6 +661,16 @@ the `cronjob` tool, the `hermes cron` CLI (`list`, `add`, `edit`,
   `skip_memory=True` by default, and cron deliveries are framed with a
   header/footer instead of being mirrored into the target gateway
   session (keeps role alternation intact).
+- **Profile-scoped delivery pitfall:** `run_job()` may load a per-job
+  profile env and then restore `os.environ` before delivery. If a
+  `profile=<name>` no-agent job runs outside the gateway/systemd
+  EnvironmentFile, standalone Discord/Telegram delivery can fail even
+  though the script succeeded (e.g. `DISCORD_BOT_TOKEN is not set`). Fix
+  by loading env through the shared `load_hermes_dotenv()` path with the
+  root `.hermes/.env` as a non-overriding fallback for profile homes, and
+  re-enter only the job's profile context around `_deliver_result()` so
+  `save_job_output()`/`mark_job_run()` still write to the canonical cron
+  store.
 
 User docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/cron
 
