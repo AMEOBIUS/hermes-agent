@@ -170,6 +170,9 @@ def _is_transient_network_error(exc: BaseException) -> bool:
         "ServerDisconnectedError",
         "ClientConnectorError",
         "ClientOSError",
+        "ProxyError",
+        "ProxyConnectionError",
+        "ProxyTimeoutError",
     }
     while cur is not None and depth < 12:
         ident = id(cur)

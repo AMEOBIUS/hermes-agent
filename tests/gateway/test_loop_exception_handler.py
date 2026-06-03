@@ -52,6 +52,18 @@ class ClientConnectorError(Exception):
     """Stand-in for ``aiohttp.ClientConnectorError``."""
 
 
+class ProxyError(Exception):
+    """Stand-in for ``python_socks._errors.ProxyError``."""
+
+
+class ProxyConnectionError(Exception):
+    """Stand-in for ``python_socks._errors.ProxyConnectionError``."""
+
+
+class ProxyTimeoutError(Exception):
+    """Stand-in for ``python_socks._errors.ProxyTimeoutError``."""
+
+
 class SomeUnrelatedBug(Exception):
     """A non-transient error that should NOT be swallowed."""
 
@@ -70,6 +82,9 @@ class SomeUnrelatedBug(Exception):
         ReadTimeout,
         PoolTimeout,
         ClientConnectorError,
+        ProxyError,
+        ProxyConnectionError,
+        ProxyTimeoutError,
     ],
 )
 def test_transient_classifier_matches_known_network_errors(exc_cls):
