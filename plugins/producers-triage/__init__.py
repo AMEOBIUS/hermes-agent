@@ -35,6 +35,8 @@ QUEUE_FILE = PRODUCERS_DIR / "gitdb_tools_queue.json"
 POST_STATE_FILE = PRODUCERS_DIR / "gitdb_tools_post_state.json"
 SANITY_SCRIPT = PRODUCERS_DIR / "scripts" / "public_text_sanitizer.py"
 GROWTH_ACTIONS_FILE = PRODUCERS_DIR / "discord_channel_growth_actions.json"
+HUMAN_QUESTIONS_FILE = PRODUCERS_DIR / "discord_human_questions.json"
+HUMAN_QUESTIONS_SCRIPT = PRODUCERS_DIR / "scripts" / "discord_human_questions.py"
 
 
 def run_sanitizer(text: str) -> str:
@@ -161,6 +163,54 @@ def load_growth_actions() -> dict[str, Any]:
         return {}
 
 
+def load_human_questions() -> dict[str, Any]:
+    if HUMAN_QUESTIONS_FILE.is_file():
+        try:
+            return json.loads(HUMAN_QUESTIONS_FILE.read_text())
+        except Exception:
+            pass
+
+    if not HUMAN_QUESTIONS_SCRIPT.is_file():
+        return {}
+
+    try:
+        subprocess.run(
+            [sys.executable, str(HUMAN_QUESTIONS_SCRIPT)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        if HUMAN_QUESTIONS_FILE.is_file():
+            return json.loads(HUMAN_QUESTIONS_FILE.read_text())
+    except Exception as e:
+        logger.warning(f"Failed to generate human questions: {e}")
+    return {}
+
+
+def format_human_questions_reply() -> str:
+    report = load_human_questions()
+    questions = report.get("questions", []) if report else []
+    if not questions:
+        return "готовых вопросов пока нет - сначала нужен ночной замер метрик роста"
+
+    totals = report.get("totals", {}) or {}
+    lines = [
+        "вопросы для оживления дискорда:",
+        f"human ratio сейчас: {totals.get('human_ratio', 'unknown')}",
+        "",
+    ]
+    for idx, item in enumerate(questions[:5], 1):
+        channel = item.get("channel", "канал")
+        question = item.get("question", "какой один вопрос стоит задать тут?")
+        followup = item.get("followup", "достаточно короткого ответа")
+        lines.append(f"{idx}- {channel}: {question}")
+        lines.append(f"   добивка: {followup}")
+
+    lines.append("")
+    lines.append("важно: это ручные вопросы, не автопостинг - гвард публикаций остается включенным")
+    return run_sanitizer("\n".join(lines))
+
+
 def _format_delta(value: Any) -> str:
     try:
         number = int(value)
@@ -260,6 +310,10 @@ async def pre_gateway_dispatch(
         set_user_consent(author, False, channel_id)
         reply = run_sanitizer(f"понял, {author} - исключил твои наработки из дайджестов")
         await event.reply(reply)
+        return {"action": "skip"}
+
+    if "кработ вопросы" in norm_text or "кработ оживи" in norm_text or "кработ вовлечение" in norm_text:
+        await event.reply(format_human_questions_reply())
         return {"action": "skip"}
 
     if "кработ метрики" in norm_text or "кработ рост" in norm_text or "кработ каналы" in norm_text:
