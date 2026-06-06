@@ -3487,7 +3487,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     placeholder="оставь пустым для instrumental",
                     style=discord.TextStyle.paragraph,
                     required=False,
-                    max_length=5000,
+                    max_length=4000,
                 )
                 options = discord.ui.TextInput(
                     label="алиас и модель",
