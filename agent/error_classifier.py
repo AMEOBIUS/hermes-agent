@@ -298,9 +298,9 @@ _PROVIDER_POLICY_BLOCKED_PATTERNS = [
 # data/privacy guardrail) — these are *per-prompt* safety decisions made by
 # the upstream model provider. They are deterministic for the unchanged
 # request, so retrying the same prompt three times just reproduces the same
-# block and burns paid attempts on a refusal. The recovery is to switch to a
-# configured fallback model/provider immediately, or surface the block to
-# the user with actionable guidance if no fallback exists.
+# block and burns paid attempts on a refusal. The recovery is to surface the
+# block with actionable guidance; automatic model fallback would obscure the
+# provider's safety decision and may route security-sensitive work unexpectedly.
 #
 # Patterns are intentionally narrow — each phrase is a verbatim string from
 # a specific provider's safety pipeline, not a generic word like "policy" or
@@ -546,7 +546,7 @@ def classify_api_error(
         return _result(
             FailoverReason.content_policy_blocked,
             retryable=False,
-            should_fallback=True,
+            should_fallback=False,
         )
 
     # Anthropic thinking block signature invalid (400).

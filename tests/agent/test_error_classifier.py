@@ -471,14 +471,14 @@ class TestClassifyApiError:
     #
     # Distinct from ``provider_policy_blocked`` above — these are upstream
     # model-provider safety refusals for THIS prompt, not OpenRouter
-    # account-level data policy. Recovery is fallback model, not config fix.
+    # account-level data policy. Recovery is explicit user action, not config fix.
     # See issue #18028 — OpenAI Codex was burning 3 retries on identical
     # refusals before users saw "API failed after 3 retries" on Telegram.
 
     def test_message_only_cyber_content_policy_blocked(self):
         # OpenAI Codex returns this without an HTTP status. Retrying the
         # same prompt three times only repeats the same policy decision, so
-        # the classifier must jump straight to fallback / abort instead of
+        # the classifier must jump straight to abort instead of
         # leaving it in the retryable ``unknown`` bucket.
         e = Exception(
             "This content was flagged for possible cybersecurity risk. If this "
@@ -488,7 +488,7 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="openai-codex", model="gpt-5.5")
         assert result.reason == FailoverReason.content_policy_blocked
         assert result.retryable is False
-        assert result.should_fallback is True
+        assert result.should_fallback is False
         assert result.should_compress is False
 
     def test_400_cyber_content_policy_blocked(self):
@@ -501,7 +501,7 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="openai-codex", model="gpt-5.5")
         assert result.reason == FailoverReason.content_policy_blocked
         assert result.retryable is False
-        assert result.should_fallback is True
+        assert result.should_fallback is False
 
     def test_openai_usage_policy_violation_content_policy_blocked(self):
         # OpenAI moderation refusal wording from chat completions / responses.
@@ -513,7 +513,7 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="openai", model="gpt-4o")
         assert result.reason == FailoverReason.content_policy_blocked
         assert result.retryable is False
-        assert result.should_fallback is True
+        assert result.should_fallback is False
 
     def test_anthropic_safety_system_content_policy_blocked(self):
         # Anthropic safety refusal — distinct phrasing from OpenAI.
@@ -524,7 +524,7 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="anthropic", model="claude-3-5-sonnet")
         assert result.reason == FailoverReason.content_policy_blocked
         assert result.retryable is False
-        assert result.should_fallback is True
+        assert result.should_fallback is False
 
     def test_azure_content_filter_content_policy_blocked(self):
         # Azure OpenAI returns ``content_filter`` finish reason / error code

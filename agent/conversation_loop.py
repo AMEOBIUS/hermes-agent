@@ -3301,18 +3301,13 @@ def run_conversation(
                 ) and not is_context_length_error
 
                 if is_client_error:
-                    # Try fallback before aborting — a different provider may
-                    # not have the same issue (rate limit, auth, etc.). Only
-                    # announce the attempt when a fallback chain actually
-                    # exists; otherwise "trying fallback..." is a lie and the
-                    # session looks like it's recovering when it's about to
-                    # abort silently (#35314, #17446).
-                    if agent._has_pending_fallback():
-                        if classified.reason == FailoverReason.content_policy_blocked:
-                            agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
-                        else:
-                            agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    # Try fallback before aborting — except content-policy
+                    # refusals, where auto-switching models would obscure the
+                    # provider's deterministic safety decision.
+                    allow_fallback = classified.reason != FailoverReason.content_policy_blocked
+                    if allow_fallback and agent._has_pending_fallback():
+                        agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
+                    if allow_fallback and agent._try_activate_fallback(reason=classified.reason):
                         retry_count = 0
                         compression_attempts = 0
                         primary_recovery_attempted = False
@@ -3383,8 +3378,8 @@ def run_conversation(
                     # Content-policy blocks deserve their own actionable
                     # guidance — neither "fix your API key" nor "retry won't
                     # help" tells the user what to actually do. The provider
-                    # has refused this specific prompt, so the recovery is
-                    # either a rephrase or routing to a different model.
+                    # has refused this specific prompt, so the recovery is a
+                    # rephrase, narrower context, or an explicitly chosen route.
                     if classified.reason == FailoverReason.content_policy_blocked:
                         agent._vprint(
                             f"{agent.log_prefix}   💡 The provider's safety filter rejected this specific prompt.",
@@ -3395,11 +3390,7 @@ def run_conversation(
                             force=True,
                         )
                         agent._vprint(
-                            f"{agent.log_prefix}      • Configure a fallback provider so future blocks route automatically:",
-                            force=True,
-                        )
-                        agent._vprint(
-                            f"{agent.log_prefix}        hermes fallback add   (interactive picker — same as `hermes model`)",
+                            f"{agent.log_prefix}      • Choose a different route explicitly if this work is authorized.",
                             force=True,
                         )
                     logger.error(f"{agent.log_prefix}Non-retryable client error: {api_error}")
@@ -3423,7 +3414,7 @@ def run_conversation(
                             f"(not a Hermes/gateway failure).\n\n"
                             f"Provider message: {_summary}\n\n"
                             f"Try rephrasing the request, narrowing the context, or "
-                            f"adding a fallback provider with `hermes fallback add`."
+                            f"choosing a different route explicitly."
                         )
                         return {
                             "final_response": _policy_response,

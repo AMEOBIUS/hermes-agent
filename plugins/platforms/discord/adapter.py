@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
 BREV_DISCORD_TITLE_MAX_CHARS = 120
-BREV_DISCORD_STYLE_MAX_CHARS = 1000
+BREV_DISCORD_STYLE_MAX_CHARS = 120
 # Discord TextInput max_length cannot exceed 4000, even though the downstream
 # runner can auto-shorten larger lyric payloads. Keep the Discord surface valid.
 BREV_DISCORD_LYRICS_MAX_CHARS = 4000
@@ -666,7 +666,7 @@ def build_brev_discord_embed_payload(state: BrevDiscordCardState) -> dict[str, A
     style_len = len(s.style)
     return {
         "title": "brev ai — карточка трека",
-        "description": "интерактивная заявка на генерацию через brev ai",
+        "description": None,
         "color": 0x2DE2E6,
         "fields": [
             {"name": "custom mode", "value": "on", "inline": True},
@@ -684,7 +684,7 @@ def build_brev_discord_embed(state: BrevDiscordCardState) -> Any:
     payload = build_brev_discord_embed_payload(state)
     embed = discord.Embed(
         title=payload["title"],
-        description=payload["description"],
+        description=payload.get("description") or None,
         color=payload["color"],
     )
     for field in payload["fields"]:

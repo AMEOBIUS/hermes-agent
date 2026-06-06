@@ -85,6 +85,28 @@ class OldAssetOnlyCDP(FakeCDP):
         return {}
 
 
+class MissingTitleVerifyCDP(FakeCDP):
+    async def evaluate(self, js: str):
+        self.evaluated.append(js)
+        if js == "FORM_JS":
+            return {"ok": True, "filled": True, "changed": {"prompt": True, "style": True, "lyrics": True}}
+        if "field_count" in js:
+            return {
+                "field_count": 3,
+                "fields": [
+                    {"placeholder": "Enter a title", "name": "suno-title-music", "id": "suno-title-music", "value_len": 0},
+                    {"placeholder": "Enter style of music", "value_len": 10},
+                    {"placeholder": "Write your own lyrics", "value_len": 20},
+                ],
+            }
+        if "clicked" in js and "button" in js:
+            self.clicked = True
+            return {"ok": True, "clicked": True, "button": "Generate"}
+        if "asset_urls" in js:
+            return {"ok": True, "blocked": False, "asset_urls": ["https://cdn.example/track.mp3"], "asset_candidates": []}
+        return {}
+
+
 def write_queue(tmp_path: Path, request_id: str) -> Path:
     queue = tmp_path / "brev_generation_requests.json"
     queue.write_text(json.dumps({"requests": [{
@@ -95,6 +117,22 @@ def write_queue(tmp_path: Path, request_id: str) -> Path:
         "style": "binaural pulse",
         "lyrics": "",
         "instrumental": True,
+        "requested_alias": "/music-ai-generator",
+    }]}, ensure_ascii=False), encoding="utf-8")
+    return queue
+
+
+def write_custom_queue(tmp_path: Path, request_id: str) -> Path:
+    queue = tmp_path / "brev_generation_requests.json"
+    queue.write_text(json.dumps({"requests": [{
+        "request_id": request_id,
+        "status": "queued",
+        "title": "Молчат дома",
+        "prompt": "",
+        "style": "post-punk revival",
+        "lyrics": "[Verse 1]\nГород захлебнулся в бесконечном крике",
+        "instrumental": False,
+        "custom_mode": True,
         "requested_alias": "/music-ai-generator",
     }]}, ensure_ascii=False), encoding="utf-8")
     return queue
@@ -168,3 +206,32 @@ async def test_live_runner_does_not_complete_on_preexisting_assets_only(tmp_path
     state = json.loads(queue.read_text(encoding="utf-8"))
     assert state["requests"][0]["status"] == "timeout"
     assert "asset_urls" not in state["requests"][0]
+
+
+@pytest.mark.asyncio
+async def test_live_runner_checkpoints_when_custom_title_was_wiped_after_fill(tmp_path, monkeypatch, capsys):
+    queue = write_custom_queue(tmp_path, "brev-test-missing-title")
+
+    monkeypatch.setattr(brev_runner, "load_helper", lambda path: FakeHelper)
+    monkeypatch.setattr(brev_runner, "CDPClient", MissingTitleVerifyCDP)
+    monkeypatch.setattr(brev_runner, "artifact_dir", lambda issue_id, request_id: tmp_path / "artifacts" / issue_id / request_id)
+
+    args = brev_runner.build_parser().parse_args([
+        "--queue", str(queue),
+        "--request-id", "brev-test-missing-title",
+        "--issue-id", "issue-test",
+        "--poll-seconds", "1",
+        "--poll-interval", "0.01",
+    ])
+
+    rc = await brev_runner.process_one(args)
+    manifest = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert manifest["final_status"] == "manual_checkpoint"
+    assert manifest["reason"] == "form_js_returned_ok_but_dom_zero"
+    assert ("title", 0) in [tuple(item) for item in manifest["zero_field_values"]]
+    assert MissingTitleVerifyCDP.instances[-1].clicked is False
+
+    state = json.loads(queue.read_text(encoding="utf-8"))
+    assert state["requests"][0]["status"] == "manual_checkpoint"

@@ -317,6 +317,22 @@ model: auto
     assert "ручную оператором" not in reply
 
 
+def test_brev_card_rejects_style_over_live_custom_mode_limit(monkeypatch):
+    monkeypatch.setattr(producers_triage, "run_sanitizer", lambda value: value)
+    raw = f"""кработ трек
+название: overcap
+стиль: {'s' * (producers_triage.BREV_MAX_STYLE_CHARS + 1)}
+лирика: text
+опции:
+model: auto
+"""
+
+    request, errors = producers_triage.create_brev_generation_request(raw, "artist", "1509389598923559053")
+
+    assert request is None
+    assert errors == [f"style длиннее {producers_triage.BREV_MAX_STYLE_CHARS} символов"]
+
+
 def test_brev_card_explicit_instrumental_false_overrides_empty_lyrics(monkeypatch):
     monkeypatch.setattr(producers_triage, "run_sanitizer", lambda value: value)
     raw = """кработ трек

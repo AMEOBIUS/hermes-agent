@@ -222,6 +222,7 @@ _ensure_discord_mock()
 
 from plugins.platforms.discord.adapter import (  # noqa: E402
     BREV_DISCORD_LYRICS_MAX_CHARS,
+    BREV_DISCORD_STYLE_MAX_CHARS,
     BrevDiscordCardState,
     DiscordAdapter,
     build_brev_discord_embed_payload,
@@ -976,6 +977,24 @@ def test_brev_discord_card_payload_hides_description_and_technical_options_from_
     assert not hasattr(state, "prompt")
     assert "описание" not in field_names
     assert "description" not in field_names
+    assert embed_payload["description"] is None
+
+
+def test_brev_discord_card_custom_mode_caps_style_to_live_limit():
+    state = BrevDiscordCardState(
+        title="cap test",
+        style="s" * (BREV_DISCORD_STYLE_MAX_CHARS + 25),
+        lyrics="lyrics",
+        instrumental=False,
+    )
+
+    payload = build_brev_discord_payload(state)
+    embed_payload = build_brev_discord_embed_payload(state)
+    fields = {field["name"]: field["value"] for field in embed_payload["fields"]}
+
+    assert f"стиль: {'s' * BREV_DISCORD_STYLE_MAX_CHARS}" in payload
+    assert "s" * (BREV_DISCORD_STYLE_MAX_CHARS + 1) not in payload
+    assert f"{BREV_DISCORD_STYLE_MAX_CHARS}/{BREV_DISCORD_STYLE_MAX_CHARS}" in fields["style of music"]
 
 
 def test_brev_discord_card_instrumental_clears_lyrics_and_renders_toggle():

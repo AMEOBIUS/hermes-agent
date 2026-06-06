@@ -1,7 +1,7 @@
 """Regression guard for #18028: provider content-policy / safety-filter
 blocks must classify as ``content_policy_blocked``, be non-retryable, and
-trigger the ``is_client_error`` abort path so the loop jumps straight to a
-configured fallback or surfaces a clear policy-block message — instead of
+trigger the ``is_client_error`` abort path so the loop surfaces a clear
+policy-block message — instead of
 burning ``api_max_retries`` paid attempts on a deterministic refusal and
 delivering "API failed after 3 retries" to Telegram/cron with no provider
 context.
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 class TestContentPolicyBlockedClassification:
     """Verify classify_api_error returns the right shape so downstream
-    recovery (fallback activation, final_response wording) fires correctly.
+    recovery (clear abort / final_response wording) fires correctly.
     """
 
     def test_openai_codex_cybersecurity_no_status(self):
@@ -36,8 +36,8 @@ class TestContentPolicyBlockedClassification:
         # caused the 3x retry burn.
         assert result.reason == FailoverReason.content_policy_blocked
         assert result.retryable is False
-        # Recovery is fallback model, not credential rotation or compression.
-        assert result.should_fallback is True
+        # Recovery is explicit user action, not automatic model switching.
+        assert result.should_fallback is False
         assert result.should_compress is False
         assert result.should_rotate_credential is False
 
@@ -46,8 +46,7 @@ class TestContentPolicyTriggersClientErrorAbort:
     """Mirror the ``is_client_error`` predicate in
     ``agent/conversation_loop.py`` and verify
     ``FailoverReason.content_policy_blocked`` resolves to True so the loop
-    aborts (after attempting fallback) instead of falling into the
-    retry-backoff path.
+    aborts without falling into the retry-backoff path.
     """
 
     def _mirror_is_client_error(
@@ -82,7 +81,7 @@ class TestContentPolicyTriggersClientErrorAbort:
         ) and not is_context_length_error
 
     def test_content_policy_blocked_triggers_abort(self):
-        """Safety-filter block must reach is_client_error → fallback/abort."""
+        """Safety-filter block must reach is_client_error → abort."""
         from agent.error_classifier import FailoverReason
 
         # What classify_api_error returns for a content-policy block:
@@ -92,9 +91,8 @@ class TestContentPolicyTriggersClientErrorAbort:
             classified_reason=FailoverReason.content_policy_blocked,
         ), (
             "FailoverReason.content_policy_blocked must trigger the "
-            "is_client_error path so fallback fires immediately instead of "
-            "burning api_max_retries paid attempts on a deterministic "
-            "safety refusal — see #18028."
+            "is_client_error path instead of burning api_max_retries paid "
+            "attempts on a deterministic safety refusal — see #18028."
         )
 
 
@@ -102,7 +100,7 @@ class TestContentPolicyPatternsAreNarrow:
     """Defensive guard: the safety-filter patterns must not collide with
     benign error wording from billing / format / generic 400 errors. If
     these regress to ``content_policy_blocked``, recovery will route to
-    the wrong code path (fallback model instead of credential rotation).
+    the wrong code path (policy abort instead of credential rotation).
     """
 
     def test_generic_400_format_error_not_misclassified(self):

@@ -7,6 +7,7 @@ advancement through multiple providers.
 
 from unittest.mock import MagicMock, patch
 
+from agent.error_classifier import FailoverReason
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
 
 
@@ -124,6 +125,16 @@ class TestFallbackChainAdvancement:
                     return_value=(_mock_client(), "gpt-4o")):
             assert agent._try_activate_fallback() is True
             assert agent._try_activate_fallback() is False
+
+    def test_content_policy_block_does_not_activate_fallback(self):
+        fbs = [{"provider": "openai", "model": "gpt-4o"}]
+        agent = _make_agent(fallback_model=fbs)
+
+        assert agent._try_activate_fallback(
+            reason=FailoverReason.content_policy_blocked
+        ) is False
+        assert agent._fallback_index == 0
+        assert agent._fallback_activated is False
 
     def test_skips_unconfigured_provider_to_next(self):
         """If resolve_provider_client returns None, skip to next in chain."""
