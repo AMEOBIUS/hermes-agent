@@ -40,6 +40,11 @@ GROWTH_STATUS_POST_STATE_FILE = PRODUCERS_DIR / "discord_growth_status_post_stat
 COMMUNITY_POST_GUARD_SCRIPT = PRODUCERS_DIR / "scripts" / "community_post_guard.py"
 HUMAN_QUESTIONS_FILE = PRODUCERS_DIR / "discord_human_questions.json"
 HUMAN_QUESTIONS_SCRIPT = PRODUCERS_DIR / "scripts" / "discord_human_questions.py"
+BREV_REQUESTS_FILE = PRODUCERS_DIR / "brev_generation_requests.json"
+BREV_ALIAS_HELPER_SCRIPT = PRODUCERS_DIR / "scripts" / "brev_alias_rotation_helper.py"
+BREV_MAX_PROMPT_CHARS = 1000
+BREV_MAX_STYLE_CHARS = 1000
+BREV_MAX_LYRICS_CHARS = 5000
 
 
 def run_sanitizer(text: str) -> str:
@@ -183,7 +188,14 @@ def _should_intercept(event: Any) -> bool:
         "кработ кандидаты",
         "кработ некст",
         "кработ следующий",
+        "кработ обнови очередь",
+        "кработ обновить очередь",
         "кработ запости",
+        "кработ brev",
+        "кработ брев",
+        "кработ трек",
+        "кработ генерация",
+        "кработ сгенерируй",
     )
     return channel_id == CHANNELS["help"] or any(trigger in norm_text for trigger in triggers)
 
@@ -448,6 +460,148 @@ def _format_delta(value: Any) -> str:
     return f"{number:+d}"
 
 
+def load_brev_requests() -> dict[str, Any]:
+    if not BREV_REQUESTS_FILE.is_file():
+        return {"requests": []}
+    try:
+        data = json.loads(BREV_REQUESTS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"requests": []}
+        data.setdefault("requests", [])
+        return data
+    except Exception:
+        return {"requests": []}
+
+
+def save_brev_requests(state: dict[str, Any]) -> None:
+    PRODUCERS_DIR.mkdir(parents=True, exist_ok=True)
+    BREV_REQUESTS_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _extract_brev_multiline_fields(raw_text: str) -> dict[str, str]:
+    fields = {"prompt": "", "style": "", "lyrics": "", "model": "", "alias": ""}
+    aliases = {
+        "prompt": "prompt",
+        "промпт": "prompt",
+        "idea": "prompt",
+        "идея": "prompt",
+        "style": "style",
+        "стиль": "style",
+        "music": "style",
+        "жанр": "style",
+        "lyrics": "lyrics",
+        "лирика": "lyrics",
+        "текст": "lyrics",
+        "model": "model",
+        "модель": "model",
+        "alias": "alias",
+        "алиас": "alias",
+        "tag": "alias",
+    }
+    current: str | None = None
+    body_lines: list[str] = []
+    for line in raw_text.splitlines():
+        m = re.match(r"^\s*([A-Za-zА-Яа-яёЁ _-]{2,24})\s*[:=]\s*(.*)$", line)
+        if m:
+            key = aliases.get(re.sub(r"\s+", " ", m.group(1).strip().lower()))
+            if key:
+                current = key
+                fields[current] = m.group(2).strip()
+                continue
+        if current:
+            fields[current] = (fields[current] + "\n" + line.rstrip()).strip()
+        else:
+            pass
+    if not fields["prompt"]:
+        clean = re.sub(r"(?is)^\s*кработ\s+(?:brev|брев|трек|генерация|сгенерируй)\s*[:=-]?\s*", "", raw_text).strip()
+        clean = "\n".join(line for line in clean.splitlines() if not re.match(r"^\s*(style|стиль|lyrics|лирика|model|модель|alias|алиас)\s*[:=]", line, re.I)).strip()
+        fields["prompt"] = clean[:BREV_MAX_PROMPT_CHARS]
+    return fields
+
+
+def _load_brev_alias_sample(seed: str, count: int = 3) -> list[str]:
+    if not BREV_ALIAS_HELPER_SCRIPT.is_file():
+        return []
+    try:
+        res = subprocess.run(
+            [sys.executable, str(BREV_ALIAS_HELPER_SCRIPT), "sample", "--count", str(count), "--seed", seed, "--live-preferred"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=12,
+        )
+    except Exception as exc:
+        logger.warning("brev alias sample failed: %s", exc)
+        return []
+    return [line.strip() for line in (res.stdout or "").splitlines() if line.strip()][:count]
+
+
+def _validate_brev_request(fields: dict[str, str]) -> list[str]:
+    errors: list[str] = []
+    if not fields.get("prompt", "").strip():
+        errors.append("нужен prompt или промпт")
+    if len(fields.get("prompt", "")) > BREV_MAX_PROMPT_CHARS:
+        errors.append(f"prompt длиннее {BREV_MAX_PROMPT_CHARS} символов")
+    if len(fields.get("style", "")) > BREV_MAX_STYLE_CHARS:
+        errors.append(f"style длиннее {BREV_MAX_STYLE_CHARS} символов")
+    if len(fields.get("lyrics", "")) > BREV_MAX_LYRICS_CHARS:
+        errors.append(f"lyrics длиннее {BREV_MAX_LYRICS_CHARS} символов")
+    return errors
+
+
+def create_brev_generation_request(raw_text: str, author: str, channel_id: str) -> tuple[dict[str, Any] | None, list[str]]:
+    fields = _extract_brev_multiline_fields(raw_text)
+    errors = _validate_brev_request(fields)
+    if errors:
+        return None, errors
+
+    req_hash = make_message_hash(raw_text, channel_id, author)
+    request_id = "brev-" + req_hash[:12]
+    state = load_brev_requests()
+    for existing in state.get("requests", []):
+        if existing.get("request_id") == request_id:
+            return existing, []
+
+    alias_preview = _load_brev_alias_sample(request_id, count=3)
+    request = {
+        "request_id": request_id,
+        "status": "queued",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "author": author,
+        "channel_id": channel_id,
+        "prompt": fields.get("prompt", "").strip(),
+        "style": fields.get("style", "").strip(),
+        "lyrics": fields.get("lyrics", "").strip(),
+        "model": fields.get("model", "").strip() or "auto",
+        "requested_alias": fields.get("alias", "").strip(),
+        "alias_preview": alias_preview,
+        "instrumental": not bool(fields.get("lyrics", "").strip()),
+        "execution": "manual_operator_required",
+    }
+    state.setdefault("requests", []).append(request)
+    state["updated_at"] = request["created_at"]
+    save_brev_requests(state)
+    return request, []
+
+
+def format_brev_request_reply(request: dict[str, Any]) -> str:
+    prompt_preview = request.get("prompt", "")[:160]
+    style_len = len(request.get("style", ""))
+    lyrics_len = len(request.get("lyrics", ""))
+    aliases = request.get("alias_preview") or []
+    lines = [
+        f"заявка на генерацию сохранена: {request.get('request_id')}",
+        f"prompt: {prompt_preview}",
+        f"style: {style_len} из {BREV_MAX_STYLE_CHARS} символов",
+        f"lyrics: {lyrics_len} из {BREV_MAX_LYRICS_CHARS} символов",
+        f"режим: {'instrumental' if request.get('instrumental') else 'lyrics'}",
+    ]
+    if aliases:
+        lines.append("алиасы на прогон: " + ", ".join(aliases[:3]))
+    lines.append("статус: в очереди, запуск только вручную оператором")
+    return run_sanitizer("\n".join(lines))
+
+
 def format_growth_metrics_reply() -> str:
     report = load_growth_actions()
     if not report:
@@ -489,6 +643,54 @@ def format_growth_metrics_reply() -> str:
 
     lines.append("")
     lines.append("правило: не увеличивать автопостинг, пока human ratio не держится выше 0.55 два ночных замера подряд")
+    return run_sanitizer("\n".join(lines))
+
+
+def trigger_queue_refresh(no_trendshift: bool = False, no_llm: bool = True) -> dict[str, Any]:
+    env = os.environ.copy()
+    env["NO_PROXY"] = "localhost,127.0.0.1"
+    env["no_proxy"] = "localhost,127.0.0.1"
+
+    script_path = PRODUCERS_DIR / "scripts" / "gitdb_tools_drafter.py"
+    if not script_path.is_file():
+        return {"ok": False, "error": "Drafter script not found"}
+
+    cmd = [sys.executable, str(script_path), "--json"]
+    if no_trendshift:
+        cmd.append("--no-trendshift")
+    if no_llm:
+        cmd.append("--no-llm")
+
+    try:
+        res = subprocess.run(cmd, cwd=str(Path("/home/ameobius/projects/security-workstation")), env=env, capture_output=True, text=True, check=True)
+        payload = {}
+        try:
+            payload = json.loads(res.stdout or "{}")
+        except Exception:
+            payload = {"raw_output": (res.stdout or "")[:1000]}
+        return {"ok": True, "output": res.stdout, "summary": payload}
+    except subprocess.CalledProcessError as e:
+        return {"ok": False, "error": f"Exit {e.returncode}: {e.stderr or e.stdout}"}
+
+
+def format_queue_refresh_result(res: dict[str, Any]) -> str:
+    if not res.get("ok"):
+        return f"обновление очереди упало: {res.get('error', 'unknown error')}"
+    summary = res.get("summary") or {}
+    counts = summary.get("source_counts") or {}
+    lines = [
+        "очередь инструментов обновлена",
+        f"кандидатов: {summary.get('candidate_count', 0)}",
+        f"отклонено шумовых: {summary.get('denied_count', 0)}",
+        f"источники: gitdb {counts.get('gitdb', 0)} - trendshift {counts.get('trendshift', 0)} - tg {counts.get('telegram', 0)} - x {counts.get('x', 0)}",
+    ]
+    top = summary.get("top") or []
+    if top:
+        lines.append("топ:")
+        for idx, item in enumerate(top[:3], 1):
+            sources = "+".join(item.get("sources") or [])
+            lines.append(f"{idx}- {item.get('full_name', 'unknown')} - score {item.get('score', 0)} - {sources}")
+    lines.append("показать очередь: кработ очередь")
     return run_sanitizer("\n".join(lines))
 
 
@@ -542,6 +744,15 @@ async def pre_gateway_dispatch(
         reply = run_sanitizer(f"понял, {author} - исключил твои наработки из дайджестов")
         await _send_reply(event, active_gateway, reply)
         return {"action": "skip"}
+
+    # Dynamic Post Guard Alerts
+    try:
+        from .alerts import _send_alert_once_per_day
+        guard_status = load_post_guard_decision()
+        if not guard_status.get("allowed", False):
+            await _send_alert_once_per_day(event, active_gateway, guard_status)
+    except Exception as exc:
+        logger.error(f"Post guard feedback-loop alert failed: {exc}")
 
     # 1.5 Prompt Doctor Command Triage & Fast-Path Fallback
     # Triggers on explicit prompt doctor commands (e.g. "кработ почини промпт", "кработ prompt doctor")
@@ -624,6 +835,25 @@ async def pre_gateway_dispatch(
         await _send_reply(event, active_gateway, run_sanitizer(f"следующий кандидат в очереди:\n\n{card}"))
         return {"action": "skip"}
 
+    if "кработ обнови очередь" in norm_text or "кработ обновить очередь" in norm_text:
+        if not is_admin:
+            await _send_reply(event, active_gateway, "команда доступна только администраторам")
+            return {"action": "skip"}
+
+        await _send_reply(event, active_gateway, "обновляю очередь инструментов - это может занять минуту")
+        loop = asyncio.get_running_loop()
+
+        def run_refresh():
+            no_trendshift = "без трендшифт" in norm_text or "no trendshift" in norm_text
+            res = trigger_queue_refresh(no_trendshift=no_trendshift, no_llm=True)
+            asyncio.run_coroutine_threadsafe(
+                _send_reply(event, active_gateway, format_queue_refresh_result(res)),
+                loop,
+            )
+
+        asyncio.create_task(asyncio.to_thread(run_refresh))
+        return {"action": "skip"}
+
     if "кработ запости" in norm_text:
         if not is_admin:
             await _send_reply(event, active_gateway, "команда доступна только администраторам")
@@ -660,6 +890,48 @@ async def pre_gateway_dispatch(
 
         asyncio.create_task(asyncio.to_thread(run_post))
         return {"action": "skip"}
+
+    brev_triggers = (
+        "кработ brev",
+        "кработ брев",
+        "кработ трек",
+        "кработ генерация",
+        "кработ сгенерируй",
+    )
+    if any(trigger in norm_text for trigger in brev_triggers):
+        request, errors = create_brev_generation_request(raw_text, author, channel_id)
+        if errors:
+            await _send_reply(
+                event,
+                active_gateway,
+                run_sanitizer(
+                    "некорректная заявка на трек:\n- " + "\n- ".join(errors)
+                    + "\nформат:\nкработ трек\nprompt: ...\nстиль: ...\nлирика: ...\nмодель: ...\n"
+                ),
+            )
+            return {"action": "skip"}
+        if request is not None:
+            request_id = request.get("request_id")
+            await _send_reply(event, active_gateway, run_sanitizer(f"заявка на трек {request_id} принята, запускаю генерацию через cdp-"))
+
+            loop = asyncio.get_running_loop()
+
+            def run_gen():
+                from .brev_runner_helper import run_brev_generation
+                res = run_brev_generation(request_id)
+                if res.get("ok"):
+                    urls = res.get("asset_urls") or []
+                    url_lines = "\n".join(f"- {u}" for u in urls)
+                    msg = f"трек готов: {request_id}\n\nфайлы:\n{url_lines}"
+                else:
+                    msg = f"ошибка при генерации {request_id}: {res.get('error', 'unknown error')}"
+                asyncio.run_coroutine_threadsafe(
+                    _send_reply(event, active_gateway, run_sanitizer(msg)),
+                    loop
+                )
+
+            asyncio.create_task(asyncio.to_thread(run_gen))
+            return {"action": "skip"}
 
     # 3. Help Intake Processing
     if channel_id == CHANNELS["help"]:
