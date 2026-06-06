@@ -46,6 +46,42 @@ BREV_MAX_TITLE_CHARS = 120
 BREV_MAX_PROMPT_CHARS = 1000
 BREV_MAX_STYLE_CHARS = 1000
 BREV_MAX_LYRICS_CHARS = 5000
+OWNER_DISCORD_USER_IDS = {"229266236859482112"}
+OWNER_FALLBACK_NAMES = {"ameobius", "a meobius", "a_meobius"}
+OWNER_ONLY_REDIRECT = "это служебная команда владельца сервера - публично внутренние детали не обсуждаю"
+OWNER_ONLY_TRIGGERS = (
+    "кработ вопросы",
+    "кработ оживи",
+    "кработ вовлечение",
+    "кработ статус роста",
+    "кработ статус канала",
+    "кработ метрики",
+    "кработ рост",
+    "кработ каналы",
+    "кработ очередь",
+    "кработ кандидаты",
+    "кработ некст",
+    "кработ следующий",
+    "кработ обнови очередь",
+    "кработ обновить очередь",
+    "кработ запости",
+)
+PUBLIC_INTERNAL_INFO_PATTERNS = (
+    r"\bhermes\b",
+    r"\bgateway\b",
+    r"гейтве[йя]",
+    r"статус\s+сервера",
+    r"перезапуск|рестарт|restart",
+    r"\bcron\b|\bкрон\b",
+    r"\bbeads\b|\.beads|\bbd\s+",
+    r"лог[иа]?\b|логи\b|logs?\b",
+    r"системн\w*\s+промпт|system\s+prompt",
+    r"конфиг|config\b|env\b",
+    r"токен|секрет|api\s*key|ключ\s+api",
+    r"внутренн|инсайдер",
+    r"архитектур|инфраструктур",
+    r"agent\s+architecture|tooling|database|db\b",
+)
 
 
 def run_sanitizer(text: str) -> str:
@@ -82,6 +118,19 @@ def _event_author(event: Any) -> str:
         or getattr(source, "user_id", None)
         or "unknown"
     )
+
+
+def _event_user_id(event: Any) -> str:
+    source = _event_source(event)
+    value = getattr(event, "user_id", None) or getattr(source, "user_id", None)
+    return str(value or "").strip()
+
+
+def _is_owner_event(event: Any) -> bool:
+    user_id = _event_user_id(event)
+    if user_id:
+        return user_id in OWNER_DISCORD_USER_IDS
+    return normalize_username(_event_author(event)) in OWNER_FALLBACK_NAMES
 
 
 def _event_channel_id(event: Any) -> str:
@@ -201,11 +250,35 @@ def _should_intercept(event: Any) -> bool:
     return channel_id == CHANNELS["help"] or any(trigger in norm_text for trigger in triggers)
 
 
+def _is_owner_only_command(norm_text: str) -> bool:
+    return any(trigger in norm_text for trigger in OWNER_ONLY_TRIGGERS)
+
+
+def _is_public_internal_info_probe(event: Any) -> bool:
+    if _is_owner_event(event):
+        return False
+    norm_text = _event_text(event).strip().lower()
+    if not norm_text:
+        return False
+    if _is_owner_only_command(norm_text):
+        return True
+    return any(re.search(pattern, norm_text) for pattern in PUBLIC_INTERNAL_INFO_PATTERNS)
+
+
+async def _send_owner_only_redirect(event: Any, gateway: Any | None) -> None:
+    await _send_reply(event, gateway, run_sanitizer(OWNER_ONLY_REDIRECT))
+
+
 def _pre_gateway_dispatch_hook(**kwargs: Any) -> dict[str, Any] | None:
     event = kwargs.get("event")
-    if event is None or not _should_intercept(event):
+    if event is None:
         return None
     gateway = kwargs.get("gateway") or kwargs.get("runner")
+    if _is_producers_profile() and _is_public_internal_info_probe(event):
+        asyncio.create_task(_send_owner_only_redirect(event, gateway))
+        return {"action": "skip", "reason": "producers-public-ops-guard"}
+    if not _should_intercept(event):
+        return None
     session_store = kwargs.get("session_store")
     asyncio.create_task(pre_gateway_dispatch(event=event, gateway=gateway, session_store=session_store))
     return {"action": "skip", "reason": "producers-triage-fast-path"}
@@ -480,7 +553,17 @@ def save_brev_requests(state: dict[str, Any]) -> None:
 
 
 def _extract_brev_multiline_fields(raw_text: str) -> dict[str, str]:
-    fields = {"title": "", "prompt": "", "style": "", "lyrics": "", "model": "", "alias": "", "options": ""}
+    fields = {
+        "title": "",
+        "prompt": "",
+        "style": "",
+        "lyrics": "",
+        "model": "",
+        "alias": "",
+        "instrumental": "",
+        "custom_mode": "",
+        "options": "",
+    }
     aliases = {
         "title": "title",
         "название": "title",
@@ -493,6 +576,7 @@ def _extract_brev_multiline_fields(raw_text: str) -> dict[str, str]:
         "idea": "prompt",
         "идея": "prompt",
         "style": "style",
+        "style of music": "style",
         "стиль": "style",
         "music": "style",
         "жанр": "style",
@@ -504,6 +588,10 @@ def _extract_brev_multiline_fields(raw_text: str) -> dict[str, str]:
         "alias": "alias",
         "алиас": "alias",
         "tag": "alias",
+        "instrumental": "instrumental",
+        "инструментал": "instrumental",
+        "custom mode": "custom_mode",
+        "custom_mode": "custom_mode",
         "options": "options",
         "опции": "options",
         "настройки": "options",
@@ -524,17 +612,26 @@ def _extract_brev_multiline_fields(raw_text: str) -> dict[str, str]:
             pass
     if fields.get("options"):
         for opt_line in fields["options"].splitlines():
-            opt_match = re.match(r"^\s*(alias|алиас|tag|model|модель)\s*[:=]\s*(.*?)\s*$", opt_line, re.I)
+            opt_match = re.match(r"^\s*(alias|алиас|tag|model|модель|instrumental|инструментал|custom mode|custom_mode)\s*[:=]\s*(.*?)\s*$", opt_line, re.I)
             if not opt_match:
                 continue
-            opt_key = aliases.get(opt_match.group(1).strip().lower())
-            if opt_key in {"alias", "model"} and opt_match.group(2).strip():
+            opt_key = aliases.get(re.sub(r"\s+", " ", opt_match.group(1).strip().lower()))
+            if opt_key in {"alias", "model", "instrumental", "custom_mode"} and opt_match.group(2).strip():
                 fields[opt_key] = opt_match.group(2).strip()
     if not fields["prompt"] and not fields["title"]:
         clean = re.sub(r"(?is)^\s*кработ\s+(?:brev|брев|трек|генерация|сгенерируй)\s*[:=-]?\s*", "", raw_text).strip()
-        clean = "\n".join(line for line in clean.splitlines() if not re.match(r"^\s*(title|название|style|стиль|lyrics|лирика|model|модель|alias|алиас|options|опции|настройки)\s*[:=]", line, re.I)).strip()
+        clean = "\n".join(line for line in clean.splitlines() if not re.match(r"^\s*(title|название|style|style of music|стиль|lyrics|лирика|model|модель|alias|алиас|instrumental|инструментал|custom mode|custom_mode|options|опции|настройки)\s*[:=]", line, re.I)).strip()
         fields["prompt"] = clean[:BREV_MAX_PROMPT_CHARS]
     return fields
+
+
+def _parse_brev_bool(value: str) -> bool | None:
+    clean = str(value or "").strip().lower()
+    if clean in {"true", "1", "yes", "y", "on", "да", "д", "instrumental", "инструментал"}:
+        return True
+    if clean in {"false", "0", "no", "n", "off", "нет", "н", "lyrics", "lyric"}:
+        return False
+    return None
 
 
 def _load_brev_alias_sample(seed: str, count: int = 3) -> list[str]:
@@ -583,6 +680,12 @@ def create_brev_generation_request(raw_text: str, author: str, channel_id: str) 
             return existing, []
 
     alias_preview = _load_brev_alias_sample(request_id, count=3)
+    explicit_instrumental = _parse_brev_bool(fields.get("instrumental", ""))
+    custom_mode = _parse_brev_bool(fields.get("custom_mode", ""))
+    lyrics = fields.get("lyrics", "").strip()
+    instrumental = explicit_instrumental if explicit_instrumental is not None else not bool(lyrics)
+    if instrumental:
+        lyrics = ""
     request = {
         "request_id": request_id,
         "status": "queued",
@@ -592,11 +695,12 @@ def create_brev_generation_request(raw_text: str, author: str, channel_id: str) 
         "title": fields.get("title", "").strip(),
         "prompt": fields.get("prompt", "").strip(),
         "style": fields.get("style", "").strip(),
-        "lyrics": fields.get("lyrics", "").strip(),
+        "lyrics": lyrics,
         "model": fields.get("model", "").strip() or "auto",
         "requested_alias": fields.get("alias", "").strip(),
         "alias_preview": alias_preview,
-        "instrumental": not bool(fields.get("lyrics", "").strip()),
+        "instrumental": instrumental,
+        "custom_mode": True if custom_mode is None else custom_mode,
         "execution": "discord_auto_run",
     }
     state.setdefault("requests", []).append(request)
@@ -607,14 +711,12 @@ def create_brev_generation_request(raw_text: str, author: str, channel_id: str) 
 
 def format_brev_request_reply(request: dict[str, Any]) -> str:
     title = request.get("title") or "без названия"
-    prompt_preview = (request.get("prompt") or "")[:160] or "не задан"
     style_len = len(request.get("style", ""))
     lyrics_len = len(request.get("lyrics", ""))
     alias = request.get("requested_alias") or "auto"
     lines = [
         f"карточка трека принята: {request.get('request_id')}",
         f"название: {title}",
-        f"описание: {prompt_preview}",
         f"стиль: {style_len} из {BREV_MAX_STYLE_CHARS} символов",
         f"лирика: {lyrics_len} из {BREV_MAX_LYRICS_CHARS} символов",
         f"режим: {'instrumental' if request.get('instrumental') else 'lyrics'}",
@@ -928,7 +1030,7 @@ async def pre_gateway_dispatch(
                 active_gateway,
                 run_sanitizer(
                     "некорректная карточка трека:\n- " + "\n- ".join(errors)
-                    + "\nформат:\nкработ трек\nназвание: ...\nописание: ...\nстиль: ...\nлирика: ...\nалиас: /tag/neurofunk\n"
+                    + "\nформат:\nкработ трек\nназвание: ...\nстиль: ...\nлирика: ...\n"
                 ),
             )
             return {"action": "skip"}

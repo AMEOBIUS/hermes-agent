@@ -21,11 +21,17 @@ import threading
 import time
 from collections import defaultdict
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
 VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
+BREV_DISCORD_TITLE_MAX_CHARS = 120
+BREV_DISCORD_STYLE_MAX_CHARS = 1000
+# Discord TextInput max_length cannot exceed 4000, even though the downstream
+# runner can auto-shorten larger lyric payloads. Keep the Discord surface valid.
+BREV_DISCORD_LYRICS_MAX_CHARS = 4000
 _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
@@ -585,13 +591,106 @@ def _read_dm_role_auth_guild() -> Optional[int]:
         raw = discord_cfg.get("dm_role_auth_guild")
     except Exception:
         return None
-    if raw is None or raw == "":
+    return _parse_guild_id(raw)
+
+
+def _parse_guild_id(value: object) -> int | None:
+    if value is None or value == "":
         return None
     try:
-        guild_id = int(raw)
+        guild_id = int(str(value).strip())
     except (TypeError, ValueError):
         return None
     return guild_id if guild_id > 0 else None
+
+
+@dataclass
+class BrevDiscordCardState:
+    """Transient UI state for the Discord Brev generation card."""
+
+    title: str = ""
+    style: str = ""
+    lyrics: str = ""
+    custom_mode: bool = True
+    instrumental: bool = False
+
+    def normalized(self) -> "BrevDiscordCardState":
+        return BrevDiscordCardState(
+            title=self.title.strip()[:BREV_DISCORD_TITLE_MAX_CHARS],
+            style=self.style.strip()[:BREV_DISCORD_STYLE_MAX_CHARS],
+            # Preserve lyrics in UI state even when instrumental is toggled on,
+            # so a mistaken toggle does not erase the user's draft. Payload
+            # generation is responsible for suppressing lyrics for instrumental.
+            lyrics=self.lyrics.strip()[:BREV_DISCORD_LYRICS_MAX_CHARS],
+            custom_mode=True,
+            instrumental=bool(self.instrumental),
+        )
+
+
+def _brev_preview(value: str, limit: int = 220) -> str:
+    clean = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not clean:
+        return "не заполнено"
+    return clean if len(clean) <= limit else clean[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _brev_bool_literal(value: bool) -> str:
+    return "true" if bool(value) else "false"
+
+
+def build_brev_discord_payload(state: BrevDiscordCardState) -> str:
+    """Build the text command consumed by producers-triage from card state."""
+
+    s = state.normalized()
+    payload_lyrics = "" if s.instrumental else s.lyrics
+    return "\n".join(
+        [
+            "кработ трек",
+            f"название: {s.title}",
+            f"стиль: {s.style}",
+            f"instrumental: {_brev_bool_literal(s.instrumental)}",
+            f"custom_mode: {_brev_bool_literal(s.custom_mode)}",
+            f"лирика: {payload_lyrics}",
+            "опции:",
+            "model: auto",
+        ]
+    ).strip()
+
+
+def build_brev_discord_embed_payload(state: BrevDiscordCardState) -> dict[str, Any]:
+    """Return a serialisable Discord embed payload for the interactive card."""
+
+    s = state.normalized()
+    complete = bool(s.title)
+    status = "готово к генерации" if complete else "заполни название"
+    style_len = len(s.style)
+    return {
+        "title": "brev ai — карточка трека",
+        "description": "интерактивная заявка на генерацию через brev ai",
+        "color": 0x2DE2E6,
+        "fields": [
+            {"name": "custom mode", "value": "on", "inline": True},
+            {"name": "instrumental", "value": "on" if s.instrumental else "off", "inline": True},
+            {"name": "статус", "value": status, "inline": False},
+            {"name": "title", "value": _brev_preview(s.title, 180), "inline": False},
+            {"name": "style of music", "value": f"{_brev_preview(s.style, 260)}\n{style_len}/{BREV_DISCORD_STYLE_MAX_CHARS}", "inline": False},
+            {"name": "lyrics", "value": ("instrumental — текст не отправляется" if s.instrumental else f"{_brev_preview(s.lyrics, 260)}\n{len(s.lyrics)}/{BREV_DISCORD_LYRICS_MAX_CHARS}"), "inline": False},
+        ],
+        "footer": {"text": "edit fields -> generate music"},
+    }
+
+
+def build_brev_discord_embed(state: BrevDiscordCardState) -> Any:
+    payload = build_brev_discord_embed_payload(state)
+    embed = discord.Embed(
+        title=payload["title"],
+        description=payload["description"],
+        color=payload["color"],
+    )
+    for field in payload["fields"]:
+        embed.add_field(name=field["name"], value=field["value"], inline=field["inline"])
+    embed.set_footer(text=payload["footer"]["text"])
+    return embed
 
 
 class DiscordAdapter(BasePlatformAdapter):
@@ -3461,71 +3560,143 @@ class DiscordAdapter(BasePlatformAdapter):
 
 
         if os.getenv("HERMES_PRODUCERS_BREV_CARD", "true").strip().lower() not in {"0", "false", "no", "off"}:
-            class BrevTrackModal(discord.ui.Modal, title="заявка на трек"):
+            class BrevTrackEditModal(discord.ui.Modal, title="заявка на трек"):
                 track_title = discord.ui.TextInput(
-                    label="название",
+                    label="title",
                     placeholder="например: nocturnal pulse",
                     required=True,
-                    max_length=120,
-                )
-                prompt = discord.ui.TextInput(
-                    label="описание",
-                    placeholder="идея, вайб, референсы, ограничения",
-                    style=discord.TextStyle.paragraph,
-                    required=True,
-                    max_length=1000,
+                    max_length=BREV_DISCORD_TITLE_MAX_CHARS,
                 )
                 style_text = discord.ui.TextInput(
-                    label="стиль",
+                    label="style of music",
                     placeholder="neurodance, binaural asmr pulses, organic percussion",
                     style=discord.TextStyle.paragraph,
                     required=False,
-                    max_length=1000,
+                    max_length=BREV_DISCORD_STYLE_MAX_CHARS,
                 )
                 lyrics = discord.ui.TextInput(
-                    label="лирика",
+                    label="lyrics",
                     placeholder="оставь пустым для instrumental",
                     style=discord.TextStyle.paragraph,
                     required=False,
-                    max_length=4000,
+                    max_length=BREV_DISCORD_LYRICS_MAX_CHARS,
                 )
-                options = discord.ui.TextInput(
-                    label="алиас и модель",
-                    placeholder="alias: /tag/neurofunk\nmodel: auto",
-                    style=discord.TextStyle.paragraph,
-                    required=False,
-                    max_length=500,
-                )
-
-                def __init__(self, adapter: "DiscordAdapter"):
+                def __init__(self, view: "BrevTrackCardView"):
                     super().__init__()
-                    self.adapter = adapter
+                    self.view_ref = view
+                    state = view.state.normalized()
+                    self.track_title.default = state.title
+                    self.style_text.default = state.style
+                    self.lyrics.default = state.lyrics
 
                 async def on_submit(self, interaction: discord.Interaction) -> None:
-                    if not await self.adapter._check_slash_authorization(interaction, "/brev-card"):
+                    if not await self.view_ref.adapter._check_slash_authorization(interaction, "/brev-card"):
                         return
-                    await interaction.response.defer(ephemeral=True)
-                    text = "\n".join([
-                        "кработ трек",
-                        f"название: {str(self.track_title.value).strip()}",
-                        f"описание: {str(self.prompt.value).strip()}",
-                        f"стиль: {str(self.style_text.value).strip()}",
-                        f"лирика: {str(self.lyrics.value).strip()}",
-                        "опции:",
-                        str(self.options.value).strip(),
-                    ]).strip()
+                    self.view_ref.state = BrevDiscordCardState(
+                        title=str(self.track_title.value).strip(),
+                        style=str(self.style_text.value).strip(),
+                        lyrics=str(self.lyrics.value).strip(),
+                        custom_mode=True,
+                        instrumental=self.view_ref.state.instrumental,
+                    ).normalized()
+                    await interaction.response.edit_message(
+                        embed=build_brev_discord_embed(self.view_ref.state),
+                        view=self.view_ref,
+                    )
+
+            class BrevTrackCardView(discord.ui.View):
+                def __init__(self, adapter: "DiscordAdapter", state: BrevDiscordCardState | None = None):
+                    super().__init__(timeout=900)
+                    self.adapter = adapter
+                    self.state = (state or BrevDiscordCardState()).normalized()
+
+                    self.edit_button = discord.ui.Button(
+                        label="edit fields",
+                        style=discord.ButtonStyle.secondary,
+                        custom_id="brev_card_edit_fields",
+                        row=0,
+                    )
+                    self.edit_button.callback = self._edit_fields
+                    self.add_item(self.edit_button)
+
+                    self.instrumental_button = discord.ui.Button(
+                        label=self._instrumental_label(),
+                        style=self._instrumental_style(),
+                        custom_id="brev_card_toggle_instrumental",
+                        row=0,
+                    )
+                    self.instrumental_button.callback = self._toggle_instrumental
+                    self.add_item(self.instrumental_button)
+
+                    self.generate_button = discord.ui.Button(
+                        label="generate music",
+                        style=discord.ButtonStyle.primary,
+                        custom_id="brev_card_generate_music",
+                        row=1,
+                    )
+                    self.generate_button.callback = self._generate_music
+                    self.add_item(self.generate_button)
+
+                def _instrumental_label(self) -> str:
+                    return "instrumental: on" if self.state.instrumental else "instrumental: off"
+
+                def _instrumental_style(self):
+                    return discord.ButtonStyle.success if self.state.instrumental else discord.ButtonStyle.secondary
+
+                def _refresh_buttons(self) -> None:
+                    self.instrumental_button.label = self._instrumental_label()
+                    self.instrumental_button.style = self._instrumental_style()
+
+                async def interaction_check(self, interaction: discord.Interaction) -> bool:
+                    return await self.adapter._check_slash_authorization(interaction, "/brev-card")
+
+                async def _edit_fields(self, interaction: discord.Interaction) -> None:
+                    await interaction.response.send_modal(BrevTrackEditModal(self))
+
+                async def _toggle_instrumental(self, interaction: discord.Interaction) -> None:
+                    self.state = BrevDiscordCardState(
+                        title=self.state.title,
+                        style=self.state.style,
+                        lyrics=self.state.lyrics,
+                        custom_mode=True,
+                        instrumental=not self.state.instrumental,
+                    ).normalized()
+                    self._refresh_buttons()
+                    await interaction.response.edit_message(
+                        embed=build_brev_discord_embed(self.state),
+                        view=self,
+                    )
+
+                async def _generate_music(self, interaction: discord.Interaction) -> None:
+                    state = self.state.normalized()
+                    if not state.title:
+                        await interaction.response.send_message(
+                            "нужно заполнить title",
+                            ephemeral=True,
+                        )
+                        return
+                    await interaction.response.defer(ephemeral=True, thinking=True)
+                    text = build_brev_discord_payload(state)
                     event = self.adapter._build_slash_event(interaction, text)
                     await self.adapter.handle_message(event)
                     try:
                         await interaction.edit_original_response(content="карточка отправлена в генерацию")
                     except Exception as exc:
-                        logger.debug("Discord brev modal ack failed: %s", exc)
+                        logger.debug("Discord brev card ack failed: %s", exc)
 
-            @tree.command(name="brev-card", description="Открыть карточку заявки на трек Brev")
+            self._brev_track_edit_modal_cls = BrevTrackEditModal
+            self._brev_track_card_view_cls = BrevTrackCardView
+
+            @tree.command(name="brev-card", description="Открыть интерактивную карточку заявки на трек Brev")
             async def slash_brev_card(interaction: discord.Interaction):
                 if not await self._check_slash_authorization(interaction, "/brev-card"):
                     return
-                await interaction.response.send_modal(BrevTrackModal(self))
+                state = BrevDiscordCardState()
+                await interaction.response.send_message(
+                    embed=build_brev_discord_embed(state),
+                    view=BrevTrackCardView(self, state),
+                    ephemeral=True,
+                )
 
         @tree.command(name="queue", description="Queue a prompt for the next turn (doesn't interrupt)")
         @discord.app_commands.describe(prompt="The prompt to queue")

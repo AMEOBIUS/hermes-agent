@@ -22,6 +22,73 @@ def _ensure_discord_mock():
         discord_mod.ForumChannel = type("ForumChannel", (), {})
         discord_mod.Interaction = object
 
+        class _FakeTextStyle:
+            paragraph = "paragraph"
+
+        class _FakeButtonStyle:
+            primary = "primary"
+            secondary = "secondary"
+            success = "success"
+
+        class _FakeTextInput:
+            def __init__(self, *, label, placeholder="", style=None, required=True, max_length=None):
+                self.label = label
+                self.placeholder = placeholder
+                self.style = style
+                self.required = required
+                self.max_length = max_length
+                self.default = ""
+                self.value = ""
+
+        class _FakeModal:
+            def __init_subclass__(cls, **kwargs):
+                cls.title = kwargs.pop("title", "")
+                super().__init_subclass__(**kwargs)
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+        class _FakeButton:
+            def __init__(self, *, label="", style=None, custom_id=None, row=None):
+                self.label = label
+                self.style = style
+                self.custom_id = custom_id
+                self.row = row
+                self.callback = None
+
+        class _FakeView:
+            def __init__(self, *, timeout=None):
+                self.timeout = timeout
+                self.children = []
+
+            def add_item(self, item):
+                self.children.append(item)
+                return item
+
+        class _FakeEmbed:
+            def __init__(self, *, title="", description="", color=None):
+                self.title = title
+                self.description = description
+                self.color = color
+                self.fields = []
+                self.footer = SimpleNamespace(text="")
+
+            def add_field(self, *, name, value, inline=False):
+                self.fields.append(SimpleNamespace(name=name, value=value, inline=inline))
+
+            def set_footer(self, *, text=""):
+                self.footer = SimpleNamespace(text=text)
+
+        discord_mod.TextStyle = _FakeTextStyle
+        discord_mod.ButtonStyle = _FakeButtonStyle
+        discord_mod.Embed = _FakeEmbed
+        discord_mod.ui = SimpleNamespace(
+            Modal=_FakeModal,
+            View=_FakeView,
+            Button=_FakeButton,
+            TextInput=_FakeTextInput,
+        )
+
         # Lightweight mock for app_commands.Group and Command used by
         # _register_skill_group.
         class _FakeGroup:
@@ -62,20 +129,104 @@ def _ensure_discord_mock():
         sys.modules.setdefault("discord.ext.commands", commands_mod)
 
     # Whether we just installed the mock OR another test module installed
-    # it first via its own _ensure_discord_mock, force the decorators we
-    # need onto discord.app_commands — the flat /skill command uses
-    # @app_commands.autocomplete and not every other mock stub exposes it.
-    _app = getattr(sys.modules["discord"], "app_commands", None)
+    # it first via its own _ensure_discord_mock, force the decorators and
+    # lightweight UI surface we need onto it.  Several gateway tests install
+    # partial discord mocks before this file is imported, so this block must
+    # be idempotent and order-independent.
+    _discord = sys.modules["discord"]
+    _app = getattr(_discord, "app_commands", None)
     if _app is not None and not hasattr(_app, "autocomplete"):
         try:
             _app.autocomplete = lambda **kwargs: (lambda fn: fn)
         except Exception:
             pass
 
+    class _FallbackTextStyle:
+        paragraph = "paragraph"
+
+    class _FallbackButtonStyle:
+        primary = "primary"
+        secondary = "secondary"
+        success = "success"
+
+    class _FallbackTextInput:
+        def __init__(self, *, label, placeholder="", style=None, required=True, max_length=None):
+            self.label = label
+            self.placeholder = placeholder
+            self.style = style
+            self.required = required
+            self.max_length = max_length
+            self.default = ""
+            self.value = ""
+
+    class _FallbackModal:
+        def __init_subclass__(cls, **kwargs):
+            cls.title = kwargs.pop("title", "")
+            super().__init_subclass__(**kwargs)
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class _FallbackButton:
+        def __init__(self, *, label="", style=None, custom_id=None, row=None):
+            self.label = label
+            self.style = style
+            self.custom_id = custom_id
+            self.row = row
+            self.callback = None
+
+    class _FallbackView:
+        def __init__(self, *, timeout=None):
+            self.timeout = timeout
+            self.children = []
+
+        def add_item(self, item):
+            self.children.append(item)
+            return item
+
+    class _FallbackEmbed:
+        def __init__(self, *, title="", description="", color=None):
+            self.title = title
+            self.description = description
+            self.color = color
+            self.fields = []
+            self.footer = SimpleNamespace(text="")
+
+        def add_field(self, *, name, value, inline=False):
+            self.fields.append(SimpleNamespace(name=name, value=value, inline=inline))
+
+        def set_footer(self, *, text=""):
+            self.footer = SimpleNamespace(text=text)
+
+    if not hasattr(_discord, "TextStyle"):
+        _discord.TextStyle = _FallbackTextStyle
+    if not hasattr(_discord, "ButtonStyle"):
+        _discord.ButtonStyle = _FallbackButtonStyle
+    if not hasattr(_discord, "Embed"):
+        _discord.Embed = _FallbackEmbed
+    _ui = getattr(_discord, "ui", None)
+    if _ui is None:
+        _ui = SimpleNamespace()
+        _discord.ui = _ui
+    for _name, _value in {
+        "Modal": _FallbackModal,
+        "View": _FallbackView,
+        "Button": _FallbackButton,
+        "TextInput": _FallbackTextInput,
+    }.items():
+        if not hasattr(_ui, _name):
+            setattr(_ui, _name, _value)
+
 
 _ensure_discord_mock()
 
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from plugins.platforms.discord.adapter import (  # noqa: E402
+    BREV_DISCORD_LYRICS_MAX_CHARS,
+    BrevDiscordCardState,
+    DiscordAdapter,
+    build_brev_discord_embed_payload,
+    build_brev_discord_payload,
+)
 
 
 class FakeTree:
@@ -791,6 +942,90 @@ def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
 
     import os
     assert os.getenv("DISCORD_AUTO_THREAD") == "true"
+
+
+# ------------------------------------------------------------------
+# /brev-card interactive Discord UI
+# ------------------------------------------------------------------
+
+
+def test_brev_discord_card_payload_hides_description_and_technical_options_from_user_state():
+    state = BrevDiscordCardState(
+        title=" nocturnal pulse ",
+        style="neurodance, binaural asmr pulses",
+        lyrics="verse one\nverse two",
+        instrumental=False,
+    )
+
+    payload = build_brev_discord_payload(state)
+    embed_payload = build_brev_discord_embed_payload(state)
+    field_names = {field["name"] for field in embed_payload["fields"]}
+
+    assert "кработ трек" in payload
+    assert "название: nocturnal pulse" in payload
+    assert "описание:" not in payload
+    assert "description:" not in payload
+    assert "стиль: neurodance, binaural asmr pulses" in payload
+    assert "instrumental: false" in payload
+    assert "custom_mode: true" in payload
+    assert "лирика: verse one\nverse two" in payload
+    assert "опции:" in payload
+    assert "model: auto" in payload
+    assert "alias:" not in payload
+    assert not hasattr(state, "options")
+    assert not hasattr(state, "prompt")
+    assert "описание" not in field_names
+    assert "description" not in field_names
+
+
+def test_brev_discord_card_instrumental_clears_lyrics_and_renders_toggle():
+    state = BrevDiscordCardState(
+        title="t",
+        style="s",
+        lyrics="x" * (BREV_DISCORD_LYRICS_MAX_CHARS + 100),
+        instrumental=True,
+    )
+
+    payload = build_brev_discord_payload(state)
+    embed_payload = build_brev_discord_embed_payload(state)
+    fields = {field["name"]: field["value"] for field in embed_payload["fields"]}
+
+    assert f"instrumental: true" in payload
+    assert "лирика: " in payload
+    assert "x" not in payload
+    assert fields["custom mode"] == "on"
+    assert fields["instrumental"] == "on"
+    assert "instrumental" in fields["lyrics"]
+
+
+@pytest.mark.asyncio
+async def test_brev_card_slash_sends_interactive_ephemeral_card(adapter):
+    adapter._register_slash_commands()
+
+    sent = []
+
+    async def fake_send_message(**kwargs):
+        sent.append(kwargs)
+
+    interaction = SimpleNamespace(response=SimpleNamespace(send_message=fake_send_message))
+    await adapter._client.tree.commands["brev-card"](interaction)
+
+    assert len(sent) == 1
+    assert sent[0]["ephemeral"] is True
+    assert sent[0]["embed"].title == "brev ai — карточка трека"
+    view = sent[0]["view"]
+    labels = [getattr(item, "label", "") for item in view.children]
+    assert "edit fields" in labels
+    assert "instrumental: off" in labels
+    assert "generate music" in labels
+    modal_cls = adapter._brev_track_edit_modal_cls
+    modal_fields = {
+        attr.label
+        for attr in modal_cls.__dict__.values()
+        if hasattr(attr, "label")
+    }
+    assert "алиас и модель" not in modal_fields
+    assert "описание" not in modal_fields
 
 
 # ------------------------------------------------------------------

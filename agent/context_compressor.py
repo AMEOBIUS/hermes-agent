@@ -1794,7 +1794,12 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # If the token budget would protect everything (small conversations),
         # force a cut after the head so compression can still remove middle turns.
         if cut_idx <= head_end:
-            cut_idx = max(fallback_cut, head_end + 1)
+            cut_idx = fallback_cut
+        
+        # CRITICAL FIX for #The Infinite Compacting Loop Trap:
+        # If token budget was huge, cut_idx could be 0, but we MUST keep at least 1 message
+        # outside the tail for compress() to work.
+        cut_idx = max(head_end + 1, min(cut_idx, fallback_cut))
 
         # Align to avoid splitting tool groups
         cut_idx = self._align_boundary_backward(messages, cut_idx)

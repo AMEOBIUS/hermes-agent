@@ -41,14 +41,19 @@ def producers_home(monkeypatch, tmp_path):
     monkeypatch.setattr(producers_triage, "BREV_REQUESTS_FILE", tmp_path / "brev_generation_requests.json")
 
 
-def make_event(text: str, author: str = "a meobius", chat_id: str = "1509389598923559053"):
+def make_event(
+    text: str,
+    author: str = "a meobius",
+    chat_id: str = "1509389598923559053",
+    user_id: str = "229266236859482112",
+):
     return SimpleNamespace(
         text=text,
         message_id="msg-1",
         source=SimpleNamespace(
             platform="discord",
             chat_id=chat_id,
-            user_id="user-1",
+            user_id=user_id,
             user_name=author,
             thread_id=None,
         ),
@@ -88,6 +93,51 @@ def test_hook_ignores_non_trigger_messages(monkeypatch):
     producers_triage.register(ctx)
     result = ctx.hooks[0][1](event=make_event("обычный текст", chat_id="other"), gateway=make_gateway(DummyAdapter()))
     assert result is None
+
+
+def test_public_internal_info_probe_is_blocked_for_non_owner(monkeypatch):
+    scheduled = []
+
+    def fake_create_task(coro):
+        scheduled.append(coro)
+        coro.close()
+        return object()
+
+    monkeypatch.setattr(producers_triage.asyncio, "create_task", fake_create_task)
+    ctx = DummyCtx()
+    producers_triage.register(ctx)
+    result = ctx.hooks[0][1](
+        event=make_event(
+            "кработ статус сервера и логи gateway",
+            author="public user",
+            chat_id="1509389578015080609",
+            user_id="111111111111111111",
+        ),
+        gateway=make_gateway(DummyAdapter()),
+    )
+
+    assert result == {"action": "skip", "reason": "producers-public-ops-guard"}
+    assert len(scheduled) == 1
+
+
+def test_owner_internal_info_probe_is_not_blocked(monkeypatch):
+    scheduled = []
+
+    def fake_create_task(coro):
+        scheduled.append(coro)
+        coro.close()
+        return object()
+
+    monkeypatch.setattr(producers_triage.asyncio, "create_task", fake_create_task)
+    ctx = DummyCtx()
+    producers_triage.register(ctx)
+    result = ctx.hooks[0][1](
+        event=make_event("кработ статус роста"),
+        gateway=make_gateway(DummyAdapter()),
+    )
+
+    assert result == {"action": "skip", "reason": "producers-triage-fast-path"}
+    assert len(scheduled) == 1
 
 
 @pytest.mark.asyncio
@@ -199,7 +249,7 @@ async def test_brev_request_schedules_background_generation(monkeypatch):
 @pytest.mark.asyncio
 async def test_queue_refresh_command_is_admin_only(monkeypatch):
     adapter = DummyAdapter()
-    event = make_event("кработ обнови очередь", author="artist one")
+    event = make_event("кработ обнови очередь", author="artist one", user_id="111111111111111111")
     monkeypatch.setattr(producers_triage, "run_sanitizer", lambda value: value)
 
     result = await producers_triage.pre_gateway_dispatch(event=event, gateway=make_gateway(adapter))
@@ -237,15 +287,13 @@ async def test_queue_refresh_command_schedules_background_refresh(monkeypatch):
     assert "очередь инструментов обновлена" in adapter.send.await_args_list[1].args[1]
 
 
-def test_brev_card_fields_include_title_alias_and_friendly_reply(monkeypatch):
+def test_brev_card_fields_accept_custom_mode_without_description_and_use_auto_route(monkeypatch):
     monkeypatch.setattr(producers_triage, "run_sanitizer", lambda value: value)
     raw = """кработ трек
 название: nocturnal pulse
-описание: instrumental neurodance with binaural ASMR pulses
 стиль: neurodance, organic percussion
 лирика:
 опции:
-alias: /tag/neurofunk
 model: auto
 """
     request, errors = producers_triage.create_brev_generation_request(raw, "artist", "1509389598923559053")
@@ -253,14 +301,62 @@ model: auto
     assert errors == []
     assert request is not None
     assert request["title"] == "nocturnal pulse"
-    assert request["prompt"] == "instrumental neurodance with binaural ASMR pulses"
+    assert request["prompt"] == ""
     assert request["style"] == "neurodance, organic percussion"
-    assert request["requested_alias"] == "/tag/neurofunk"
+    assert request["requested_alias"] == ""
+    assert request["model"] == "auto"
     assert request["instrumental"] is True
+    assert request["custom_mode"] is True
     assert request["execution"] == "discord_auto_run"
 
     reply = producers_triage.format_brev_request_reply(request)
     assert "карточка трека принята" in reply
     assert "название: nocturnal pulse" in reply
+    assert "описание:" not in reply
     assert "статус: запускаю генерацию" in reply
     assert "ручную оператором" not in reply
+
+
+def test_brev_card_explicit_instrumental_false_overrides_empty_lyrics(monkeypatch):
+    monkeypatch.setattr(producers_triage, "run_sanitizer", lambda value: value)
+    raw = """кработ трек
+название: lyric draft
+описание: generate a lyrical neurodance sketch
+style of music: neurodance
+instrumental: false
+custom_mode: true
+лирика:
+опции:
+alias: /tag/neurofunk
+model: auto
+"""
+
+    request, errors = producers_triage.create_brev_generation_request(raw, "artist", "1509389598923559053")
+
+    assert errors == []
+    assert request is not None
+    assert request["instrumental"] is False
+    assert request["custom_mode"] is True
+    assert request["requested_alias"] == "/tag/neurofunk"
+    assert request["model"] == "auto"
+
+
+def test_brev_card_explicit_instrumental_true_clears_lyrics(monkeypatch):
+    monkeypatch.setattr(producers_triage, "run_sanitizer", lambda value: value)
+    raw = """кработ трек
+название: instrumental draft
+описание: generate an instrumental neurodance sketch
+стиль: neurodance
+лирика: should be ignored
+опции:
+instrumental: on
+custom_mode: on
+"""
+
+    request, errors = producers_triage.create_brev_generation_request(raw, "artist", "1509389598923559053")
+
+    assert errors == []
+    assert request is not None
+    assert request["instrumental"] is True
+    assert request["lyrics"] == ""
+    assert request["custom_mode"] is True
