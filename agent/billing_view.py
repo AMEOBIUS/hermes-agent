@@ -10,8 +10,6 @@ gracefully (never crash).
 
 Money discipline: the server emits decimal STRINGS (``"142.5"``, not fixed 2dp).
 We keep them as :class:`decimal.Decimal` end-to-end and only format for display.
-
-See docs/plans/2026-06-13-001-phase-2b-terminal-billing-tui-plan.md.
 """
 
 from __future__ import annotations

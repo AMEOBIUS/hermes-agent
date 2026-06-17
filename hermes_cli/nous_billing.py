@@ -5,7 +5,7 @@ billing screens drive. Companion to ``hermes_cli/nous_account.py`` (which owns
 read-only entitlement/balance) — this module owns the *write* side: buy credits,
 poll a charge, configure auto-reload.
 
-Design rules (see docs/plans/2026-06-13-001-phase-2b-terminal-billing-tui-plan.md):
+Design rules:
 
 - **Money is decimal, never float.** The server emits decimal STRINGS
   (``"142.5"`` — not fixed 2dp). We parse with :class:`decimal.Decimal` and never
