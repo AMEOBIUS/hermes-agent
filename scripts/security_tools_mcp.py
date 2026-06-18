@@ -20,6 +20,7 @@ import json
 import subprocess
 import sys
 import shutil
+import os
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -185,7 +186,18 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
     elif name == "httpx_probe":
         inp = args["input"]
         flags = args.get("flags", "-status-code -title -tech-detect").split()
-        cmd = ["httpx"] + flags
+        # Use projectdiscovery httpx (Go binary), not Python httpx
+        pdx = shutil.which("httpx")
+        if pdx and "go/bin" in pdx:
+            cmd = [pdx] + flags
+        else:
+            # Try common Go bin locations
+            for candidate in [os.path.expanduser("~/go/bin/httpx"), "/usr/local/go/bin/httpx"]:
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    cmd = [candidate] + flags
+                    break
+            else:
+                return "projectdiscovery httpx not found. Install: go install github.com/projectdiscovery/httpx/cmd/httpx@latest"
         if inp.startswith("/"):
             cmd += ["-l", inp]
         else:
