@@ -2773,6 +2773,36 @@ class TestFallbackModelInheritance(unittest.TestCase):
         _, kwargs = MockAgent.call_args
         self.assertEqual(kwargs["fallback_model"], [fallback_entry])
 
+    def test_delegation_fallback_model_overrides_parent_chain(self):
+        """delegation.fallback_model is the explicit child fallback chain."""
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [
+            {"provider": "openrouter", "model": "parent-fallback", "api_key": "sk-or-x"}
+        ]
+        delegation_fallback = {
+            "provider": "custom:cliproxy",
+            "model": "mimo-v2.5-pro",
+            "base_url": "http://127.0.0.1:8317/v1",
+            "api_key": "test-key",
+        }
+
+        with patch("tools.delegate_tool._load_config", return_value={"fallback_model": delegation_fallback}), \
+             patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test fallback override",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["fallback_model"], delegation_fallback)
+
     def test_child_gets_no_fallback_when_parent_chain_empty(self):
         """When parent._fallback_chain is empty, fallback_model is None."""
         parent = _make_mock_parent(depth=0)
