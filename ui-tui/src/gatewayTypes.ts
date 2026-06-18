@@ -98,12 +98,23 @@ export interface BillingStateResponse {
   role: string | null
 }
 
+/**
+ * Raw error payload echoed from the server (`_serialize_billing_error`). Carries
+ * the extra fields a few error codes attach — notably `remainingUsd` on
+ * `monthly_cap_exceeded` — so the client can render the same detail the CLI does.
+ */
+export interface BillingErrorPayload {
+  isDefaultCeiling?: boolean
+  remainingUsd?: string
+}
+
 export interface BillingChargeResponse {
   charge_id?: string
   error?: string
   idempotency_key?: string
   message?: string
   ok: boolean
+  payload?: BillingErrorPayload
   portal_url?: string | null
   retry_after?: number | null
 }
@@ -113,6 +124,7 @@ export interface BillingChargeStatusResponse {
   error?: string
   message?: string
   ok: boolean
+  payload?: BillingErrorPayload
   portal_url?: string | null
   reason?: string | null
   retry_after?: number | null
@@ -125,6 +137,7 @@ export interface BillingMutationResponse {
   granted?: boolean
   message?: string
   ok: boolean
+  payload?: BillingErrorPayload
   portal_url?: string | null
   retry_after?: number | null
 }
@@ -614,6 +627,11 @@ export type GatewayEvent =
       type: 'notification.show'
     }
   | { payload?: { key?: string }; session_id?: string; type: 'notification.clear' }
+  | {
+      payload: { user_code?: string; verification_url: string }
+      session_id?: string
+      type: 'billing.step_up.verification'
+    }
   | { payload?: { state?: 'idle' | 'listening' | 'transcribing' }; session_id?: string; type: 'voice.status' }
   | { payload?: { no_speech_limit?: boolean; text?: string }; session_id?: string; type: 'voice.transcript' }
   | { payload: { line: string }; session_id?: string; type: 'gateway.stderr' }

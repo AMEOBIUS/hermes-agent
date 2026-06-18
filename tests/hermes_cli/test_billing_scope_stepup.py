@@ -125,3 +125,69 @@ def test_step_up_falls_back_to_standard_scope_when_no_prior(monkeypatch, _stub_p
     assert "inference:invoke" in requested
     assert "tool:invoke" in requested
     assert NOUS_BILLING_MANAGE_SCOPE in requested
+
+
+# ---------------------------------------------------------------------------
+# on_verification callback plumbing (TUI surfaces the device-flow URL via this)
+# ---------------------------------------------------------------------------
+
+
+def test_step_up_forwards_on_verification_callback(monkeypatch, _stub_persist):
+    monkeypatch.setattr(auth, "get_provider_auth_state", lambda p: {})
+    captured = {}
+
+    def _fake_login(**kw):
+        captured.update(kw)
+        return {"scope": "inference:invoke tool:invoke billing:manage"}
+
+    monkeypatch.setattr(auth, "_nous_device_code_login", _fake_login)
+
+    def _cb(url, code):
+        pass
+
+    step_up_nous_billing_scope(on_verification=_cb)
+    # The callback must be threaded straight through to the device-code login.
+    assert captured["on_verification"] is _cb
+
+
+def test_device_login_fires_on_verification_before_polling(monkeypatch):
+    """on_verification(url, code) must fire BEFORE _poll_for_token (so the TUI
+    can render the link while the flow blocks waiting for approval)."""
+    order: list[str] = []
+
+    monkeypatch.setattr(
+        auth,
+        "_request_device_code",
+        lambda **kw: {
+            "verification_uri_complete": "https://portal.example/device?code=ABCD",
+            "user_code": "ABCD-1234",
+            "device_code": "dev",
+            "expires_in": 600,
+            "interval": 5,
+        },
+    )
+
+    def _fake_poll(**kw):
+        order.append("poll")
+        return {"access_token": "t", "scope": "inference:invoke", "expires_in": 3600}
+
+    monkeypatch.setattr(auth, "_poll_for_token", _fake_poll)
+
+    seen = {}
+
+    def _cb(url, code):
+        order.append("verify")
+        seen["url"] = url
+        seen["code"] = code
+
+    # We only assert the callback fires before polling. Post-poll token
+    # validation (JWT usability checks) is out of scope and may raise on the
+    # synthetic token — swallow it; the ordering assertion is what matters.
+    try:
+        auth._nous_device_code_login(open_browser=False, on_verification=_cb)
+    except Exception:
+        pass
+
+    assert order[:2] == ["verify", "poll"], "callback must fire before polling"
+    assert seen["url"] == "https://portal.example/device?code=ABCD"
+    assert seen["code"] == "ABCD-1234"

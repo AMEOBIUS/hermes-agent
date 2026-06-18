@@ -207,6 +207,7 @@ def build_billing_state(*, timeout: float = 15.0) -> BillingState:
         from hermes_cli.nous_billing import (
             BillingAuthError,
             BillingError,
+            _absolutize_portal_url,
             get_billing_state,
             resolve_portal_base_url,
         )
@@ -224,8 +225,10 @@ def build_billing_state(*, timeout: float = 15.0) -> BillingState:
         logger.debug("billing ▸ /state unexpected error (fail-open)", exc_info=True)
         return BillingState(logged_in=False, error="could not load billing state")
 
-    # Prefer a server-supplied portalUrl if present; else build the standard one.
-    portal_url = payload.get("portalUrl") if isinstance(payload, dict) else None
+    # Prefer a server-supplied portalUrl if present (resolved to absolute in case
+    # it's relative); else build the standard one.
+    raw_portal = payload.get("portalUrl") if isinstance(payload, dict) else None
+    portal_url = _absolutize_portal_url(raw_portal) if raw_portal else None
     if not portal_url:
         try:
             portal_url = _fallback_portal_url(resolve_portal_base_url())

@@ -55,8 +55,12 @@ def test_billing_overview_non_interactive_renders_text_not_modal(cli, monkeypatc
     assert "Usage credits" in out
     assert "$142.50" in out
     assert "$180 of $1000 used (default ceiling)" in out
-    # Non-interactive lists subcommands as text.
-    assert "/billing buy" in out
+    # New design: a spend bar with a percentage on the overview.
+    assert "%" in out and ("█" in out or "░" in out)
+    # ZERO sub-commands: no /billing buy|auto-reload|limit advertising.
+    assert "/billing buy" not in out
+    assert "Actions:" not in out
+    # Non-interactive funnels to the portal (the URL is the affordance).
     assert "Manage on portal:" in out
 
 
@@ -90,24 +94,43 @@ def test_billing_limit_screen_readonly(cli, monkeypatch, capsys):
         portal_url="https://portal/billing",
     )
     monkeypatch.setattr(bv, "build_billing_state", lambda *a, **kw: state)
-    cli._show_billing("/billing limit")
+    # ZERO sub-commands: the limit screen is reached via the menu, never a
+    # sub-command — call it directly the way the overview menu would.
+    cli._billing_limit_screen(state)
     out = capsys.readouterr().out
     assert "Monthly spend limit" in out
     assert "$250 of $1000 used" in out
     assert "read-only" in out
 
 
+def test_billing_sub_arg_ignored_opens_overview(cli, monkeypatch, capsys):
+    # A stray sub-arg must NOT error and must NOT dispatch to a sub-screen —
+    # it just opens the overview (spec §0.4: zero sub-commands).
+    monkeypatch.setattr(HermesCLI, "_prompt_text_input_modal", _boom_modal, raising=False)
+    state = BillingState(
+        logged_in=True, role="OWNER", balance_usd=Decimal("142.5"),
+        cli_billing_enabled=True, charge_presets=(Decimal("25"),),
+        portal_url="https://portal/billing",
+    )
+    monkeypatch.setattr(bv, "build_billing_state", lambda *a, **kw: state)
+    cli._show_billing("/billing buy")  # arg is ignored
+    out = capsys.readouterr().out
+    assert "Usage credits" in out  # overview, NOT the buy screen
+    assert "Buy usage credits" not in out
+
+
 def test_billing_buy_non_interactive_defers_to_portal(cli, monkeypatch, capsys):
     monkeypatch.setattr(HermesCLI, "_prompt_text_input_modal", _boom_modal, raising=False)
     state = BillingState(
         logged_in=True, role="OWNER", cli_billing_enabled=True,
-        charge_presets=(Decimal("100"), Decimal("250")),
+        charge_presets=(Decimal("25"), Decimal("50"), Decimal("100")),
         card=CardInfo(brand="visa", last4="4242"),
         portal_url="https://portal/billing",
     )
     monkeypatch.setattr(bv, "build_billing_state", lambda *a, **kw: state)
-    cli._show_billing("/billing buy")
+    # Reached via the menu in real use; non-interactively it defers to the portal.
+    cli._billing_buy_flow(state)
     out = capsys.readouterr().out
     assert "Buy usage credits" in out
-    assert "$100" in out and "$250" in out
+    assert "$25" in out and "$50" in out and "$100" in out
     assert "interactive CLI" in out  # defers; no charge attempted non-interactively

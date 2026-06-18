@@ -174,6 +174,7 @@ _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
 # response writes are safe.
 _LONG_HANDLERS = frozenset(
     {
+        "billing.step_up",
         "browser.manage",
         "cli.exec",
         "plugins.manage",
@@ -5204,11 +5205,28 @@ def _(rid, params: dict) -> dict:
 
     Triggered by the TUI after a billing call returns error=insufficient_scope.
     Returns granted:false when the server silently downscopes (non-admin / unticked).
+
+    Runs on the thread pool (in _LONG_HANDLERS): the device flow blocks for the
+    whole device-code lifetime (minutes), so it must not stall the main stdin loop.
+    The verification URL/code reach the TUI via an out-of-band ``billing.step_up.
+    verification`` event (a plain print would be dropped by the JSON-RPC stdout
+    pipe), and the browser is opened TUI-side via openExternalUrl — never with the
+    gateway's headless webbrowser.open (hence open_browser=False).
     """
+    sid = params.get("session_id") or ""
     try:
         from hermes_cli.auth import step_up_nous_billing_scope
 
-        granted = step_up_nous_billing_scope(open_browser=True)
+        def _on_verification(url: str, code: str) -> None:
+            _emit(
+                "billing.step_up.verification",
+                sid,
+                {"verification_url": url, "user_code": code},
+            )
+
+        granted = step_up_nous_billing_scope(
+            open_browser=False, on_verification=_on_verification
+        )
         return _ok(rid, {"ok": True, "granted": bool(granted)})
     except Exception as exc:
         return _ok(rid, {"ok": False, "error": "error", "message": str(exc), "granted": False})

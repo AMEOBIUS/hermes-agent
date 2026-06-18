@@ -7866,6 +7866,7 @@ def _nous_device_code_login(
     timeout_seconds: float = 15.0,
     insecure: bool = False,
     ca_bundle: Optional[str] = None,
+    on_verification: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[str, Any]:
     """Run the Nous device-code flow and return full OAuth state without persisting."""
     pconfig = PROVIDER_REGISTRY["nous"]
@@ -7919,6 +7920,16 @@ def _nous_device_code_login(
                 print("  (Opened browser for verification)")
             else:
                 print("  Could not open browser automatically — use the URL above.")
+
+        # Surface the verification URL/code to an out-of-band consumer (e.g. the
+        # TUI gateway, whose stdout is a JSON-RPC pipe — a plain print() there is
+        # dropped). Fired AFTER the print/browser block and BEFORE polling blocks,
+        # so the consumer can render the link while we wait. Best-effort.
+        if on_verification is not None:
+            try:
+                on_verification(verification_url, user_code)
+            except Exception:
+                pass
 
         effective_interval = max(1, min(interval, DEVICE_AUTH_POLL_INTERVAL_CAP_SECONDS))
         print(f"Waiting for approval (polling every {effective_interval}s)...")
@@ -8007,6 +8018,7 @@ def step_up_nous_billing_scope(
     *,
     open_browser: bool = True,
     timeout_seconds: float = 15.0,
+    on_verification: Optional[Callable[[str, str], None]] = None,
 ) -> bool:
     """Re-run the device flow requesting ``billing:manage`` and persist the result.
 
@@ -8047,6 +8059,7 @@ def step_up_nous_billing_scope(
         scope=scope,
         open_browser=open_browser,
         timeout_seconds=timeout_seconds,
+        on_verification=on_verification,
     )
 
     with _auth_store_lock():

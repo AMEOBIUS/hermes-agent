@@ -120,25 +120,94 @@ def resolve_portal_base_url(state: Optional[dict[str, Any]] = None) -> str:
     return DEFAULT_PORTAL_BASE_URL
 
 
-def _resolve_token_and_base() -> tuple[str, str]:
+def _absolutize_portal_url(portal_url: Optional[str]) -> Optional[str]:
+    """Resolve a (possibly relative) server portalUrl to an absolute URL.
+
+    The server emits ``portalUrl`` relative by design (e.g. ``/billing?topup=open``)
+    — it doesn't know which deployment the client points at. Resolve it against the
+    client's portal base (preview / staging / prod) so deep-links are clickable.
+    Idempotent: an already-absolute URL is returned unchanged (urljoin keeps it).
+    """
+    if not (isinstance(portal_url, str) and portal_url.strip()):
+        return portal_url
+    base = resolve_portal_base_url()
+    # urljoin needs a trailing slash on the base to treat it as a directory and
+    # join an absolute path like "/billing?..." against the host. An already-
+    # absolute portal_url (with its own scheme/host) is returned as-is.
+    return urllib.parse.urljoin(base.rstrip("/") + "/", portal_url)
+
+
+# Short-lived cache for the resolved (token, base). `resolve_nous_access_token`
+# acquires two cross-process file locks + reads two files on every call (even on
+# its fast path), which is wasteful when the 2s/5-min charge poll loop calls a
+# billing endpoint ~150x per purchase. Cache the result briefly: the resolver
+# only ever returns a token with >=120s of life (its refresh skew), so a 30s
+# cache can never hand back an about-to-expire token. A 401 still surfaces
+# normally (the cache holds a valid token, not the HTTP outcome).
+_TOKEN_CACHE_TTL_SECONDS = 30.0
+_token_cache: tuple[float, str, str] | None = None  # (cached_at, token, base)
+
+
+def _billing_not_logged_in(exc: Optional[BaseException] = None) -> "BillingAuthError":
+    """Build the canonical 'not logged in' BillingAuthError (single source)."""
+    err = BillingAuthError(
+        "Not logged into Nous Portal — run `hermes portal` to log in.",
+        status=401,
+        error="invalid_token",
+    )
+    if exc is not None:
+        err.__cause__ = exc
+    return err
+
+
+def _resolve_token_and_base(*, use_cache: bool = True) -> tuple[str, str]:
     """Return ``(access_token, portal_base_url)`` for billing calls.
 
-    Raises :class:`BillingAuthError` when no Nous access token is held.
+    Uses the same refresh-aware resolver the inference path uses
+    (``resolve_nous_access_token``), so a short-lived (~15 min) access token that
+    has expired is transparently refreshed via the stored ``refresh_token``
+    instead of failing as "not logged in". Raises :class:`BillingAuthError` only
+    when there is no usable Nous session at all.
+
+    The result is cached for ``_TOKEN_CACHE_TTL_SECONDS`` to keep the charge poll
+    loop from re-locking + re-reading the auth store on every 2s tick. Pass
+    ``use_cache=False`` to force a fresh resolution (e.g. after a 401).
     """
+    global _token_cache
+    import time as _time
+
+    if use_cache and _token_cache is not None:
+        cached_at, token, base = _token_cache
+        if (_time.time() - cached_at) < _TOKEN_CACHE_TTL_SECONDS:
+            return token, base
+
     try:
         from hermes_cli.auth import get_provider_auth_state
 
         state = get_provider_auth_state("nous") or {}
     except Exception:
         state = {}
-    token = state.get("access_token")
-    if not (isinstance(token, str) and token.strip()):
-        raise BillingAuthError(
-            "Not logged into Nous Portal — run `hermes portal` to log in.",
-            status=401,
-            error="invalid_token",
-        )
-    return token.strip(), resolve_portal_base_url(state)
+
+    base = resolve_portal_base_url(state)
+
+    try:
+        from hermes_cli.auth import AuthError, resolve_nous_access_token
+    except ImportError:
+        # auth module unavailable — fall back to the raw stored token.
+        token = state.get("access_token")
+        if isinstance(token, str) and token.strip():
+            resolved = (token.strip(), base)
+            _token_cache = (_time.time(), *resolved)
+            return resolved
+        raise _billing_not_logged_in()
+
+    try:
+        token = resolve_nous_access_token()
+    except AuthError as exc:
+        raise _billing_not_logged_in(exc) from exc
+    resolved = (token.strip(), base)
+    _token_cache = (_time.time(), *resolved)
+    return resolved
 
 
 # =============================================================================
@@ -168,7 +237,9 @@ def _raise_for_error(
     """Map an HTTP error response to the right typed :class:`BillingError`."""
     error = payload.get("error") if isinstance(payload, dict) else None
     message = payload.get("message") if isinstance(payload, dict) else None
-    portal_url = payload.get("portalUrl") if isinstance(payload, dict) else None
+    portal_url = _absolutize_portal_url(
+        payload.get("portalUrl") if isinstance(payload, dict) else None
+    )
     retry_after = _retry_after_seconds(headers)
 
     common = {
@@ -199,13 +270,16 @@ def _request(
     body: Optional[dict[str, Any]] = None,
     extra_headers: Optional[dict[str, str]] = None,
     timeout: float = DEFAULT_TIMEOUT,
+    _retried_auth: bool = False,
 ) -> dict[str, Any]:
     """Make an authenticated billing request; return the parsed JSON dict.
 
     Raises a typed :class:`BillingError` on any non-2xx response (or transport
-    failure). 2xx with an empty body returns ``{}``.
+    failure). 2xx with an empty body returns ``{}``. A 401 triggers exactly one
+    retry with a freshly-resolved token (bypassing the short token cache) so a
+    cached-but-just-expired token self-heals instead of failing the call.
     """
-    token, base = _resolve_token_and_base()
+    token, base = _resolve_token_and_base(use_cache=not _retried_auth)
     url = f"{base}{path}"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -224,6 +298,19 @@ def _request(
             raw = resp.read().decode("utf-8")
             return json.loads(raw) if raw.strip() else {}
     except urllib.error.HTTPError as exc:
+        # A 401 on a cached token → drop the cache and retry once with a fresh
+        # (refresh-aware) resolve before surfacing the auth error.
+        if exc.code == 401 and not _retried_auth:
+            global _token_cache
+            _token_cache = None
+            return _request(
+                method,
+                path,
+                body=body,
+                extra_headers=extra_headers,
+                timeout=timeout,
+                _retried_auth=True,
+            )
         raw = ""
         try:
             raw = exc.read().decode("utf-8")

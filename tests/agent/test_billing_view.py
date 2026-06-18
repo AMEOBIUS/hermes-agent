@@ -187,7 +187,9 @@ def test_403_insufficient_scope_maps_to_scope_required():
     with pytest.raises(BillingScopeRequired) as ei:
         _raise_for_error(403, {"error": "insufficient_scope", "portalUrl": "/billing"})
     assert ei.value.error == "insufficient_scope"
-    assert ei.value.portal_url == "/billing"
+    # portalUrl is resolved to an absolute URL (relative-by-design from the server).
+    assert (ei.value.portal_url or "").startswith("http")
+    assert (ei.value.portal_url or "").endswith("/billing")
 
 
 @pytest.mark.parametrize("status", [429, 503])
@@ -219,7 +221,9 @@ def test_other_403s_map_to_base_error_with_portal_url(error):
     # Not a scope/auth/rate subclass — the generic gate-denial path.
     assert not isinstance(ei.value, (BillingScopeRequired, BillingAuthError, BillingRateLimited))
     assert ei.value.error == error
-    assert ei.value.portal_url == "/billing?topup=open"
+    # portalUrl resolved to an absolute deep-link (server sends it relative).
+    assert (ei.value.portal_url or "").startswith("http")
+    assert (ei.value.portal_url or "").endswith("/billing?topup=open")
 
 
 def test_monthly_cap_exceeded_carries_remaining_in_payload():
