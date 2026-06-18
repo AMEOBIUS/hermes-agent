@@ -25,7 +25,12 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
-from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
+from hermes_cli.timeouts import (
+    get_provider_request_timeout,
+    get_provider_stale_timeout,
+    get_provider_system_prompt_char_limit,
+    get_provider_tool_allowlist,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.model_metadata import is_local_endpoint
@@ -555,6 +560,35 @@ def interruptible_api_call(agent, api_kwargs: dict):
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     tools_for_api = agent.tools
+    tool_allowlist = get_provider_tool_allowlist(agent.provider, agent.model)
+    if tool_allowlist is not None and tools_for_api:
+        allowed_tools = set(tool_allowlist)
+        tools_for_api = [
+            tool
+            for tool in tools_for_api
+            if (
+                isinstance(tool, dict)
+                and isinstance(tool.get("function"), dict)
+                and tool["function"].get("name") in allowed_tools
+            )
+        ]
+
+    system_limit = get_provider_system_prompt_char_limit(agent.provider, agent.model)
+    if system_limit is not None and isinstance(api_messages, list):
+        trimmed_messages = []
+        trimmed = False
+        for message in api_messages:
+            if (
+                not trimmed
+                and isinstance(message, dict)
+                and message.get("role") == "system"
+                and isinstance(message.get("content"), str)
+                and len(message["content"]) > system_limit
+            ):
+                message = {**message, "content": message["content"][:system_limit]}
+                trimmed = True
+            trimmed_messages.append(message)
+        api_messages = trimmed_messages
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
