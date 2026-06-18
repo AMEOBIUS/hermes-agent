@@ -37,6 +37,7 @@ import type {
   SkillHubScan,
 } from "@/lib/api";
 import { ToolsetConfigDrawer } from "@/components/ToolsetConfigDrawer";
+import ArdDiscoveryTab from "@/components/ArdDiscoveryTab";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { Toast } from "@nous-research/ui/ui/components/toast";
 import { Card, CardContent, CardHeader, CardTitle } from "@nous-research/ui/ui/components/card";
@@ -125,7 +126,7 @@ export default function SkillsPage() {
   const [toolsets, setToolsets] = useState<ToolsetInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
-  const [view, setView] = useState<"skills" | "toolsets" | "hub">("skills");
+  const [view, setView] = useState<"skills" | "toolsets" | "hub" | "ard">("skills");
   const [activeCategory, setActiveCategory] = useState<string | null>(null);
   const [togglingSkills, setTogglingSkills] = useState<Set<string>>(new Set());
   const [configToolset, setConfigToolset] = useState<ToolsetInfo | null>(null);
@@ -328,6 +329,15 @@ export default function SkillsPage() {
                   active={view === "hub"}
                   onClick={() => {
                     setView("hub");
+                    setSearch("");
+                  }}
+                />
+                <PanelItem
+                  icon={Globe}
+                  label="ARD Discovery"
+                  active={view === "ard"}
+                  onClick={() => {
+                    setView("ard");
                     setSearch("");
                   }}
                 />
@@ -539,6 +549,8 @@ export default function SkillsPage() {
                 </div>
               )}
             </>
+          ) : view === "ard" ? (
+            <ArdDiscoveryTab />
           ) : (
             <HubBrowser showToast={showToast} />
           )}
