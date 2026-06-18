@@ -48,7 +48,7 @@ from agent.tool_guardrails import (
     ToolGuardrailDecision,
 )
 from hermes_cli.config import cfg_get
-from hermes_cli.timeouts import get_provider_request_timeout
+from hermes_cli.timeouts import get_provider_max_tokens, get_provider_request_timeout
 from hermes_constants import get_hermes_home
 from utils import base_url_host_matches
 
@@ -1307,6 +1307,9 @@ def init_agent(
                     f"  Falling back to provider default.\n",
                     file=sys.stderr,
                 )
+    _provider_max_tokens = get_provider_max_tokens(agent.provider, agent.model)
+    if _provider_max_tokens is not None:
+        agent.max_tokens = _provider_max_tokens
     agent._session_init_model_config["max_tokens"] = agent.max_tokens
 
     # Read explicit context_length override from model config

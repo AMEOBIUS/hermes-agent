@@ -89,7 +89,7 @@ import shutil
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -3734,6 +3734,52 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         logger.info(summary)
 
     return _existing_tool_names()
+
+
+def add_mcp_server_from_config(config: Dict[str, Any]) -> Tuple[bool, str]:
+    """Dynamically register a single MCP server at runtime.
+
+    Used by ARD (Agentic Resource Discovery) when an MCP server is discovered
+    and the user/agent requests auto-registration.
+
+    Args:
+        config: Dict with keys:
+            - name: server name (sanitized for use as a tool prefix)
+            - url: MCP server URL (HTTP/StreamableHTTP transport)
+            - transport: "streamable_http" (default) or "sse"
+
+    Returns:
+        (success, message) tuple.
+    """
+    name = str(config.get("name", "")).strip()
+    url = str(config.get("url", "")).strip()
+    transport = str(config.get("transport", "streamable_http")).strip()
+
+    if not name or not url:
+        return False, "MCP config must include 'name' and 'url'"
+
+    # Build the server config dict in the format register_mcp_servers expects
+    server_config: Dict[str, Any] = {"url": url}
+    if transport == "sse":
+        server_config["transport"] = "sse"
+    # Default timeout for ARD-discovered servers
+    server_config["timeout"] = 120
+    server_config["connect_timeout"] = 60
+
+    servers = {name: server_config}
+
+    try:
+        registered = register_mcp_servers(servers)
+        # Check if our server actually connected
+        with _lock:
+            connected = name in _servers
+        if connected:
+            tool_count = len(getattr(_servers[name], "_registered_tool_names", []))
+            return True, f"Connected: {tool_count} tool(s) from '{name}'"
+        else:
+            return False, f"Server '{name}' failed to connect"
+    except Exception as exc:
+        return False, str(exc)
 
 
 def discover_mcp_tools() -> List[str]:

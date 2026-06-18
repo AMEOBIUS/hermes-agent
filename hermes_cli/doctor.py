@@ -8,6 +8,8 @@ import os
 import sys
 import subprocess
 import shutil
+import json
+import re
 from pathlib import Path
 
 from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
@@ -75,6 +77,165 @@ def _safe_which(cmd: str) -> str | None:
         return shutil.which(cmd)
     except Exception:
         return None
+
+
+def _run_npm_audit_json(npm_bin: str, npm_dir: Path) -> dict:
+    """Return `npm audit` JSON for runtime deps only.
+
+    Doctor is a runtime readiness check, not a monorepo CI/SCA gate. Omitting
+    dev dependencies keeps workspace-only build/test advisories from being
+    mislabeled as operator-facing runtime issues.
+    """
+    audit_result = subprocess.run(
+        [npm_bin, "audit", "--omit=dev", "--json"],
+        cwd=str(npm_dir),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return json.loads(audit_result.stdout) if audit_result.stdout.strip() else {}
+
+
+_SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+.*)?$")
+
+
+def _parse_npm_semver(version: str) -> tuple | None:
+    match = _SEMVER_RE.match((version or "").strip())
+    if not match:
+        return None
+    major, minor, patch, prerelease = match.groups()
+    return (int(major), int(minor), int(patch), prerelease or "")
+
+
+def _compare_npm_semver(left: str, right: str) -> int | None:
+    left_parsed = _parse_npm_semver(left)
+    right_parsed = _parse_npm_semver(right)
+    if left_parsed is None or right_parsed is None:
+        return None
+
+    left_core = left_parsed[:3]
+    right_core = right_parsed[:3]
+    if left_core < right_core:
+        return -1
+    if left_core > right_core:
+        return 1
+
+    left_pre = left_parsed[3]
+    right_pre = right_parsed[3]
+    if left_pre == right_pre:
+        return 0
+    if not left_pre:
+        return 1
+    if not right_pre:
+        return -1
+    if left_pre < right_pre:
+        return -1
+    if left_pre > right_pre:
+        return 1
+    return 0
+
+
+def _npm_semver_satisfies(version: str, range_expr: str) -> bool | None:
+    version = (version or "").strip()
+    range_expr = (range_expr or "").strip()
+    if not version or not range_expr:
+        return None
+
+    for clause in (part.strip() for part in range_expr.split("||")):
+        if not clause:
+            continue
+
+        if " - " in clause:
+            lower, upper = (part.strip() for part in clause.split(" - ", 1))
+            lower_cmp = _compare_npm_semver(version, lower)
+            upper_cmp = _compare_npm_semver(version, upper)
+            if lower_cmp is None or upper_cmp is None:
+                return None
+            if lower_cmp >= 0 and upper_cmp <= 0:
+                return True
+            continue
+
+        clause_ok = True
+        for token in clause.split():
+            token = token.strip()
+            if not token:
+                continue
+
+            operator = "="
+            target = token
+            for candidate in (">=", "<=", ">", "<", "="):
+                if token.startswith(candidate):
+                    operator = candidate
+                    target = token[len(candidate):].strip()
+                    break
+
+            comparison = _compare_npm_semver(version, target)
+            if comparison is None:
+                return None
+
+            if operator == ">=" and comparison < 0:
+                clause_ok = False
+                break
+            if operator == "<=" and comparison > 0:
+                clause_ok = False
+                break
+            if operator == ">" and comparison <= 0:
+                clause_ok = False
+                break
+            if operator == "<" and comparison >= 0:
+                clause_ok = False
+                break
+            if operator == "=" and comparison != 0:
+                clause_ok = False
+                break
+
+        if clause_ok:
+            return True
+
+    return False
+
+
+def _read_npm_node_version(npm_dir: Path, node_path: str) -> str | None:
+    pkg_path = npm_dir / node_path / "package.json"
+    if not pkg_path.exists():
+        return None
+    try:
+        payload = json.loads(pkg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    version = payload.get("version")
+    return version.strip() if isinstance(version, str) else None
+
+
+def _filter_stale_npm_audit_vulnerabilities(audit_data: dict, npm_dir: Path) -> tuple[dict, list[str]]:
+    vulnerabilities = audit_data.get("vulnerabilities") or {}
+    active: dict = {}
+    stale: list[str] = []
+
+    for name, entry in vulnerabilities.items():
+        range_expr = entry.get("range")
+        node_paths = entry.get("nodes") or []
+        installed_versions = [
+            version
+            for version in (_read_npm_node_version(npm_dir, node_path) for node_path in node_paths)
+            if version
+        ]
+
+        if not range_expr or not installed_versions:
+            active[name] = entry
+            continue
+
+        evaluations = [_npm_semver_satisfies(version, range_expr) for version in installed_versions]
+        if any(result is None for result in evaluations):
+            active[name] = entry
+            continue
+
+        if any(evaluations):
+            active[name] = entry
+        else:
+            stale.append(name)
+
+    return active, stale
 
 
 def _termux_browser_setup_steps(node_installed: bool) -> list[str]:
@@ -1451,12 +1612,12 @@ def run_doctor(args):
     else:
         check_warn("Node.js not found", "(optional, needed for browser tools)")
     
-    # npm audit for all Node.js packages
+    # npm audit for runtime Node.js packages
     _npm_bin = _safe_which("npm")
     if _npm_bin:
         npm_dirs = [
-            (PROJECT_ROOT, "Browser tools (agent-browser)"),
-            (PROJECT_ROOT / "scripts" / "whatsapp-bridge", "WhatsApp bridge"),
+            (PROJECT_ROOT, "Hermes workspace Node.js runtime"),
+            (PROJECT_ROOT / "scripts" / "whatsapp-bridge", "WhatsApp bridge runtime"),
         ]
         for npm_dir, label in npm_dirs:
             if not (npm_dir / "node_modules").exists():
@@ -1464,20 +1625,20 @@ def run_doctor(args):
             try:
                 # Use resolved absolute path so Windows can execute
                 # npm.cmd (CreateProcessW can't run bare .cmd names).
-                audit_result = subprocess.run(
-                    [_npm_bin, "audit", "--json"],
-                    cwd=str(npm_dir),
-                    capture_output=True, text=True, timeout=30,
-                )
-                import json as _json
-                audit_data = _json.loads(audit_result.stdout) if audit_result.stdout.strip() else {}
-                vuln_count = audit_data.get("metadata", {}).get("vulnerabilities", {})
-                critical = vuln_count.get("critical", 0)
-                high = vuln_count.get("high", 0)
-                moderate = vuln_count.get("moderate", 0)
+                audit_data = _run_npm_audit_json(_npm_bin, npm_dir)
+                active_vulns, stale_vuln_names = _filter_stale_npm_audit_vulnerabilities(audit_data, npm_dir)
+                critical = sum(1 for vuln in active_vulns.values() if vuln.get("severity") == "critical")
+                high = sum(1 for vuln in active_vulns.values() if vuln.get("severity") == "high")
+                moderate = sum(1 for vuln in active_vulns.values() if vuln.get("severity") == "moderate")
                 total = critical + high + moderate
                 if total == 0:
-                    check_ok(f"{label} deps", "(no known vulnerabilities)")
+                    detail = "(no known vulnerabilities)"
+                    if stale_vuln_names:
+                        detail = (
+                            "(no active vulnerabilities; "
+                            f"suppressed stale lockfile advisories: {', '.join(sorted(stale_vuln_names))})"
+                        )
+                    check_ok(f"{label} deps", detail)
                 elif critical > 0 or high > 0:
                     check_warn(
                         f"{label} deps",
@@ -1487,12 +1648,22 @@ def run_doctor(args):
                         f"{label} has {total} npm "
                         f"{'vulnerability' if total == 1 else 'vulnerabilities'}"
                     )
+                    if stale_vuln_names:
+                        check_info(
+                            "Suppressed stale lockfile advisories: "
+                            + ", ".join(sorted(stale_vuln_names))
+                        )
                 else:
                     check_ok(
                         f"{label} deps",
                         f"({moderate} moderate "
                         f"{'vulnerability' if moderate == 1 else 'vulnerabilities'})",
                     )
+                    if stale_vuln_names:
+                        check_info(
+                            "Suppressed stale lockfile advisories: "
+                            + ", ".join(sorted(stale_vuln_names))
+                        )
             except Exception:
                 pass
 
@@ -1936,9 +2107,17 @@ def run_doctor(args):
         # Add project root to path for imports
         sys.path.insert(0, str(PROJECT_ROOT))
         from model_tools import check_tool_availability, TOOLSET_REQUIREMENTS
+        from hermes_cli.config import load_config as _load_config
+        from hermes_cli.tools_config import _get_platform_tools as _get_platform_tools
         
         available, unavailable = check_tool_availability()
         available, unavailable = _apply_doctor_tool_availability_overrides(available, unavailable)
+        enabled_toolsets = _get_platform_tools(_load_config(), "cli")
+        available = [tid for tid in available if tid in enabled_toolsets]
+        unavailable = [
+            item for item in unavailable
+            if item.get("name") in enabled_toolsets
+        ]
         
         for tid in available:
             info = TOOLSET_REQUIREMENTS.get(tid, {})
@@ -2056,14 +2235,20 @@ def run_doctor(args):
             from plugins.memory.mem0 import _load_config as _load_mem0_config
             mem0_cfg = _load_mem0_config()
             mem0_key = mem0_cfg.get("api_key", "")
-            if mem0_key:
+            mem0_host = mem0_cfg.get("host", "")
+            mem0_auth_mode = str(mem0_cfg.get("auth_mode", "auto") or "auto")
+            if mem0_host and mem0_auth_mode.lower() in {"none", "disabled", "off"}:
+                check_ok("Mem0 self-hosted endpoint configured")
+                check_info(f"host={mem0_host}  auth_mode={mem0_auth_mode}")
+                check_info(f"user_id={mem0_cfg.get('user_id', '?')}  agent_id={mem0_cfg.get('agent_id', '?')}")
+            elif mem0_key:
                 check_ok("Mem0 API key configured")
                 check_info(f"user_id={mem0_cfg.get('user_id', '?')}  agent_id={mem0_cfg.get('agent_id', '?')}")
             else:
                 _fail_and_issue(
-                    "Mem0 API key not set",
-                    "(set MEM0_API_KEY in .env or run hermes memory setup)",
-                    "Mem0 is set as memory provider but API key is missing",
+                    "Mem0 API key or self-hosted endpoint not set",
+                    "(set MEM0_API_KEY in .env, set memory.mem0.host with auth_mode=none, or run hermes memory setup)",
+                    "Mem0 is set as memory provider but no API key or self-hosted endpoint is configured",
                     issues,
                 )
         except ImportError:

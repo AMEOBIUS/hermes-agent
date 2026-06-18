@@ -56,6 +56,7 @@ from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import jittered_backoff
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from hermes_cli.timeouts import get_provider_disable_streaming
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
@@ -1346,6 +1347,8 @@ def run_conversation(
                 # attempt — switch to non-streaming for the rest of this
                 # session instead of re-failing every retry.
                 if getattr(agent, "_disable_streaming", False):
+                    _use_streaming = False
+                elif get_provider_disable_streaming(agent.provider, agent.model):
                     _use_streaming = False
                 # CopilotACPClient communicates via subprocess stdio and
                 # returns a plain SimpleNamespace — not an iterable

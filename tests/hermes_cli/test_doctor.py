@@ -33,6 +33,75 @@ class TestDoctorPlatformHints:
         assert doctor._system_package_install_cmd("ripgrep") == "sudo apt install ripgrep"
 
 
+class TestDoctorNpmAudit:
+    def test_run_npm_audit_json_omits_dev_dependencies(self, monkeypatch, tmp_path):
+        seen = {}
+
+        def fake_run(cmd, cwd=None, capture_output=None, text=None, timeout=None):
+            seen["cmd"] = cmd
+            seen["cwd"] = cwd
+            seen["capture_output"] = capture_output
+            seen["text"] = text
+            seen["timeout"] = timeout
+            return SimpleNamespace(
+                stdout='{"metadata":{"vulnerabilities":{"moderate":1}}}'
+            )
+
+        monkeypatch.setattr(doctor.subprocess, "run", fake_run)
+
+        audit_data = doctor._run_npm_audit_json("/usr/bin/npm", tmp_path)
+
+        assert seen["cmd"] == ["/usr/bin/npm", "audit", "--omit=dev", "--json"]
+        assert seen["cwd"] == str(tmp_path)
+        assert seen["capture_output"] is True
+        assert seen["text"] is True
+        assert seen["timeout"] == 30
+        assert audit_data["metadata"]["vulnerabilities"]["moderate"] == 1
+
+    def test_npm_semver_satisfies_common_audit_ranges(self):
+        assert doctor._npm_semver_satisfies("3.4.2", "<=3.4.8") is True
+        assert doctor._npm_semver_satisfies("8.0.16", "7.0.0 - 7.3.3") is False
+        assert doctor._npm_semver_satisfies("0.28.1", ">=0.27.3 <0.28.1") is False
+
+    def test_filter_stale_npm_audit_vulnerabilities_uses_installed_versions(self, tmp_path):
+        for rel_path, version in (
+            ("node_modules/dompurify", "3.4.2"),
+            ("node_modules/esbuild", "0.28.1"),
+            ("node_modules/vite", "8.0.16"),
+        ):
+            pkg_dir = tmp_path / rel_path
+            pkg_dir.mkdir(parents=True, exist_ok=True)
+            (pkg_dir / "package.json").write_text(
+                f'{{"name":"test","version":"{version}"}}',
+                encoding="utf-8",
+            )
+
+        audit_data = {
+            "vulnerabilities": {
+                "dompurify": {
+                    "severity": "moderate",
+                    "range": "<=3.4.8",
+                    "nodes": ["node_modules/dompurify"],
+                },
+                "esbuild": {
+                    "severity": "low",
+                    "range": ">=0.27.3 <0.28.1",
+                    "nodes": ["node_modules/esbuild"],
+                },
+                "vite": {
+                    "severity": "high",
+                    "range": "7.0.0 - 7.3.3",
+                    "nodes": ["node_modules/vite"],
+                },
+            }
+        }
+
+        active, stale = doctor._filter_stale_npm_audit_vulnerabilities(audit_data, tmp_path)
+
+        assert set(active) == {"dompurify"}
+        assert stale == ["esbuild", "vite"]
+
+
 class TestProviderEnvDetection:
     def test_detects_openai_api_key(self):
         content = "OPENAI_BASE_URL=http://localhost:1234/v1\nOPENAI_API_KEY=***"
@@ -217,6 +286,67 @@ def test_run_doctor_sets_interactive_env_for_tool_checks(monkeypatch, tmp_path):
         doctor_mod.run_doctor(Namespace(fix=False))
 
     assert seen["interactive"] == "1"
+
+
+def test_run_doctor_filters_tool_availability_to_enabled_cli_toolsets(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    project = tmp_path / "project"
+    home.mkdir(parents=True, exist_ok=True)
+    project.mkdir(exist_ok=True)
+    (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
+    (home / ".env").write_text("OPENAI_BASE_URL=http://127.0.0.1:8317/v1\n", encoding="utf-8")
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_platform_tools",
+        lambda *_a, **_kw: {"terminal", "browser"},
+    )
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: (
+            ["terminal", "discord"],
+            [
+                {"name": "browser", "env_vars": [], "tools": ["browser_navigate"]},
+                {"name": "x_search", "env_vars": ["XAI_API_KEY"], "tools": ["x_search"]},
+            ],
+        ),
+        TOOLSET_REQUIREMENTS={
+            "terminal": {"name": "terminal"},
+            "discord": {"name": "discord"},
+            "browser": {"name": "browser"},
+            "x_search": {"name": "x_search"},
+        },
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_xai_oauth_auth_status", lambda: {})
+    except Exception:
+        pass
+
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+    out = buf.getvalue()
+    lines = out.splitlines()
+
+    assert any("✓ terminal" in line for line in lines)
+    assert any("⚠ browser" in line for line in lines)
+    assert not any(
+        stripped == "✓ discord"
+        or stripped.startswith("✓ discord (")
+        or stripped == "⚠ discord"
+        or stripped.startswith("⚠ discord (")
+        for stripped in (line.strip() for line in lines)
+    )
+    assert not any("x_search" in line for line in lines)
+    assert "Run 'hermes setup' to configure missing API keys for full tool access" not in out
 
 
 def test_check_gateway_service_linger_warns_when_disabled(monkeypatch, tmp_path, capsys):
