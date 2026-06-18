@@ -3747,6 +3747,10 @@ def add_mcp_server_from_config(config: Dict[str, Any]) -> Tuple[bool, str]:
             - name: server name (sanitized for use as a tool prefix)
             - url: MCP server URL (HTTP/StreamableHTTP transport)
             - transport: "streamable_http" (default) or "sse"
+            - command: stdio command (alternative to url for stdio transport)
+            - args: stdio command arguments (list of strings)
+            - env: stdio environment variables (dict)
+            - workdir: working directory for stdio subprocess
 
     Returns:
         (success, message) tuple.
@@ -3754,15 +3758,48 @@ def add_mcp_server_from_config(config: Dict[str, Any]) -> Tuple[bool, str]:
     name = str(config.get("name", "")).strip()
     url = str(config.get("url", "")).strip()
     transport = str(config.get("transport", "streamable_http")).strip()
+    command = str(config.get("command", "")).strip()
+    args = config.get("args", [])
+    env = config.get("env", {})
+    workdir = config.get("workdir", "")
 
-    if not name or not url:
-        return False, "MCP config must include 'name' and 'url'"
+    if not name:
+        return False, "MCP config must include 'name'"
 
-    # Build the server config dict in the format register_mcp_servers expects
-    server_config: Dict[str, Any] = {"url": url}
+    # Stdio transport: command + args
+    if command and not url:
+        server_config: Dict[str, Any] = {
+            "command": command,
+            "args": list(args) if args else [],
+        }
+        if env:
+            server_config["env"] = dict(env)
+        if workdir:
+            server_config["workdir"] = workdir
+        server_config["timeout"] = 120
+        server_config["connect_timeout"] = 60
+
+        servers = {name: server_config}
+
+        try:
+            registered = register_mcp_servers(servers)
+            with _lock:
+                connected = name in _servers
+            if connected:
+                tool_count = len(getattr(_servers[name], "_registered_tool_names", []))
+                return True, f"Connected (stdio): {tool_count} tool(s) from '{name}'"
+            else:
+                return False, f"Server '{name}' failed to connect (stdio)"
+        except Exception as exc:
+            return False, str(exc)
+
+    # HTTP transport: url
+    if not url:
+        return False, "MCP config must include 'url' or 'command'"
+
+    server_config = {"url": url}
     if transport == "sse":
         server_config["transport"] = "sse"
-    # Default timeout for ARD-discovered servers
     server_config["timeout"] = 120
     server_config["connect_timeout"] = 60
 
