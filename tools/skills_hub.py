@@ -3897,6 +3897,10 @@ class ArdSource(SkillSource):
 
             to_query = next_batch
 
+        # Merge results from global cache (local scripts, GitDB, MCP registry)
+        global_results = _search_global_cache(query, limit)
+        all_results.extend(global_results)
+
         # Deduplicate by identifier, keep first (highest score from first registry)
         seen: set = set()
         deduped: List[SkillMeta] = []
@@ -4307,6 +4311,7 @@ def _ard_cache_paths() -> List[Path]:
         profile_hub / "ard-cache.json",
         profile_hub / "ard-mcp-registry-cache.json",
         profile_hub / "ard-gitdb-candidates.json",
+        profile_hub / "ard-local-scripts.json",
     ]
     seen: set[Path] = set()
     paths: List[Path] = []
@@ -4402,8 +4407,8 @@ def _search_ard_cache(
         return None
 
     # If legacy cache entries are explicitly tied to a registry, honor that.
-    # Imported catalog caches (MCP Registry, GitDB candidates) intentionally do
-    # not carry `registry`; they should be globally searchable.
+    # Non-registry entries (MCP Registry, GitDB, local scripts) are searched
+    # globally via _search_global_cache(), not per-registry.
     if registry_url:
         reg_entries = [
             e for e in entries
@@ -4455,6 +4460,67 @@ def _search_ard_cache(
             extra={
                 "ard_type": entry_type,
                 "ard_registry": entry.get("registry", registry_url),
+                "source_url": entry.get("source_url") or entry.get("url", ""),
+                "cache_file": entry.get("cache_file", ""),
+                "mcp": mcp,
+                "from_cache": True,
+            },
+        )
+        scored.append((score, meta))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if not scored and registry_url:
+        # No keyword matches in cache for this registry — let HTTP fire
+        return None
+    return [m for _, m in scored[:limit]]
+
+
+def _search_global_cache(query: str, limit: int = 10) -> List[SkillMeta]:
+    """Search non-registry-bound cache entries (local scripts, GitDB, MCP registry).
+
+    Unlike _search_ard_cache (which filters by registry), this searches ALL
+    cache entries that have no ``registry`` field — they are globally indexed
+    imports that don't belong to any specific ARD registry.
+    """
+    entries = _load_ard_cache()
+    if not entries:
+        return []
+
+    global_entries = [e for e in entries if isinstance(e, dict) and not e.get("registry")]
+    if not global_entries:
+        return []
+
+    query_lower = (query or "").lower()
+    query_words = [w for w in query_lower.split() if len(w) >= 2]
+    if not query_words:
+        return []
+
+    scored: List[Tuple[int, SkillMeta]] = []
+    for entry in global_entries:
+        name = str(entry.get("displayName", ""))
+        haystack = _ard_entry_search_text(entry)
+        matches = sum(1 for w in query_words if w in haystack)
+        if matches == 0:
+            continue
+        score = int((matches / max(len(query_words), 1)) * 100)
+
+        metadata = entry.get("metadata", {}) if isinstance(entry.get("metadata"), dict) else {}
+        entry_type = str(entry.get("type", ARD_TYPE_SKILL))
+        mcp = entry.get("mcp")
+        if mcp is None and entry_type in _ARD_MCP_TYPES:
+            transport = str(metadata.get("transport") or "streamable_http").replace("-", "_")
+            mcp = {"name": name, "url": entry.get("url", ""), "transport": transport}
+
+        meta = SkillMeta(
+            name=name,
+            description=str(entry.get("description", "")),
+            source="ard-cache",
+            identifier=str(entry.get("identifier", name)),
+            trust_level="community",
+            tags=entry.get("tags", []),
+            extra={
+                "ard_type": entry_type,
+                "ard_registry": "global-cache",
                 "source_url": entry.get("source_url") or entry.get("url", ""),
                 "cache_file": entry.get("cache_file", ""),
                 "mcp": mcp,
