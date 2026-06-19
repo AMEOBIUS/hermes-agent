@@ -39,6 +39,29 @@ def test_compare_queries_includes_external_when_runner_is_present() -> None:
     assert report["queries"][0]["external"][0]["identifier"] == "external:dogfood"
 
 
+def test_external_skill_search_supports_npm_cli_shape(monkeypatch) -> None:
+    calls = []
+
+    class Proc:
+        returncode = 0
+        stdout = json.dumps({
+            "local": [{"name": "youtube-content", "description": "YouTube transcripts"}],
+            "remote": [{"name": "remote-skill", "description": "Remote skill"}],
+        })
+        stderr = ""
+
+    def fake_run(argv, **_kwargs):
+        calls.append(argv)
+        return Proc()
+
+    monkeypatch.setattr(ard_skill_search_spike.subprocess, "run", fake_run)
+
+    results = ard_skill_search_spike.external_skill_search("youtube transcript", 2, command="skill-search")
+
+    assert calls[0] == ["skill-search", "youtube transcript", "--limit", "2", "--json"]
+    assert [r["name"] for r in results] == ["youtube-content", "remote-skill"]
+
+
 def test_main_writes_report_even_without_external_cli(tmp_path: Path, monkeypatch, capsys) -> None:
     report_path = tmp_path / "report.json"
     monkeypatch.setattr(ard_skill_search_spike, "find_skill_search_command", lambda: None)
