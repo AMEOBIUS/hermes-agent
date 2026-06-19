@@ -31,7 +31,15 @@ DEFAULT_QUERIES = [
 
 def _normalize(item: Any) -> dict[str, Any]:
     if isinstance(item, dict):
-        return item
+        normalized = dict(item)
+        name = normalized.get("displayName") or normalized.get("name") or normalized.get("path") or ""
+        normalized.setdefault("displayName", normalized.get("name", ""))
+        if name and not normalized.get("identifier"):
+            safe_name = str(name).replace("/", ":")
+            agent = normalized.get("agent")
+            prefix = f"external:skill-search:{agent}:" if agent else "external:skill-search:"
+            normalized["identifier"] = f"{prefix}{safe_name}"
+        return normalized
     return {
         "identifier": getattr(item, "identifier", ""),
         "displayName": getattr(item, "name", ""),
@@ -54,26 +62,42 @@ def external_skill_search(query: str, limit: int, command: str | None = None) ->
     cmd = command or find_skill_search_command()
     if not cmd:
         return []
-    # Support a conservative JSON interface. If the external CLI changes or
-    # returns non-JSON, record no external results instead of failing the spike.
-    proc = subprocess.run(
+    # Support a conservative JSON interface. `skill-search-cli` (npm) accepts
+    # the query as positional args and returns `{local: [...], remote: [...]}`;
+    # older/prototype tools may use a `search` subcommand with `{results: [...]}`.
+    attempts = [
+        [cmd, query, "--limit", str(limit), "--json"],
         [cmd, "search", query, "--limit", str(limit), "--json"],
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=60,
-    )
-    if proc.returncode != 0:
-        return []
-    try:
-        data = json.loads(proc.stdout)
-    except json.JSONDecodeError:
+    ]
+    data: Any = None
+    for argv in attempts:
+        proc = subprocess.run(
+            argv,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        if proc.returncode != 0:
+            continue
+        try:
+            data = json.loads(proc.stdout)
+            break
+        except json.JSONDecodeError:
+            continue
+    if data is None:
         return []
     if isinstance(data, list):
         return [_normalize(x) for x in data]
     if isinstance(data, dict):
-        values = data.get("results") or data.get("items") or []
+        values = data.get("results") or data.get("items")
+        if values is None and ("local" in data or "remote" in data):
+            values = []
+            for bucket in ("local", "remote"):
+                bucket_values = data.get(bucket)
+                if isinstance(bucket_values, list):
+                    values.extend(bucket_values)
         if isinstance(values, list):
             return [_normalize(x) for x in values]
     return []
