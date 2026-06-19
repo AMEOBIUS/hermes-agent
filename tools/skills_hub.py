@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 HERMES_HOME = get_hermes_home()
 SKILLS_DIR = HERMES_HOME / "skills"
 HUB_DIR = SKILLS_DIR / ".hub"
+PROFILE_HUB_DIR = HERMES_HOME / ".hub"
 LOCK_FILE = HUB_DIR / "lock.json"
 QUARANTINE_DIR = HUB_DIR / "quarantine"
 AUDIT_LOG = HUB_DIR / "audit.log"
@@ -302,6 +303,7 @@ class GitHubAuth:
             result = subprocess.run(
                 ["gh", "auth", "token"],
                 capture_output=True, text=True, timeout=5,
+                stdin=subprocess.DEVNULL,
             )
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip()
@@ -551,11 +553,8 @@ class GitHubSource(SkillSource):
             return [SkillMeta(**s) for s in cached]
 
         url = f"https://api.github.com/repos/{repo}/contents/{path.rstrip('/')}"
-        try:
-            resp = httpx.get(url, headers=self.auth.get_headers(), timeout=15, follow_redirects=True)
-            if resp.status_code != 200:
-                return []
-        except httpx.HTTPError:
+        resp = self._github_get(url)
+        if resp is None or resp.status_code != 200:
             return []
 
         entries = resp.json()
@@ -640,14 +639,97 @@ class GitHubSource(SkillSource):
 
     def _check_rate_limit_response(self, resp: "httpx.Response") -> None:
         """Flag the instance as rate-limited when GitHub returns 403 + exhausted quota."""
-        if resp.status_code == 403:
+        if resp.status_code in (403, 429):
             remaining = resp.headers.get("X-RateLimit-Remaining", "")
-            if remaining == "0":
+            if remaining == "0" or resp.status_code == 429:
                 self._rate_limited = True
                 logger.warning(
                     "GitHub API rate limit exhausted (unauthenticated: 60 req/hr). "
                     "Set GITHUB_TOKEN or install the gh CLI to raise the limit to 5,000/hr."
                 )
+
+    def _github_get(
+        self,
+        url: str,
+        *,
+        params: Optional[Dict] = None,
+        headers: Optional[Dict] = None,
+        timeout: float = 15.0,
+        max_retries: int = 3,
+    ) -> Optional["httpx.Response"]:
+        """GET against the GitHub API with retry/backoff on transient failures.
+
+        Returns the final ``httpx.Response`` (caller inspects status) or
+        ``None`` when every attempt raised a transport error.
+
+        Retries on:
+          - 403/429 with ``X-RateLimit-Remaining: 0`` — waits until the
+            reset time (capped) when the header is present, else exponential
+            backoff. This is the all-GitHub-tap-collapse case: a single
+            shared rate limit zeroes github + claude-marketplace + well-known
+            at once during the index build.
+          - 5xx and connection/timeout errors — exponential backoff.
+
+        On terminal rate-limit exhaustion the instance is flagged via
+        ``_check_rate_limit_response`` so the build can fail loud instead of
+        silently shipping an index with the GitHub sources dropped to zero.
+        """
+        hdrs = headers if headers is not None else self.auth.get_headers()
+        backoff = 1.0
+        last_resp: Optional["httpx.Response"] = None
+        for attempt in range(max_retries):
+            try:
+                resp = httpx.get(
+                    url, params=params, headers=hdrs,
+                    timeout=timeout, follow_redirects=True,
+                )
+            except httpx.HTTPError as e:
+                logger.debug("GitHub GET %s failed (attempt %d/%d): %s",
+                             url, attempt + 1, max_retries, e)
+                if attempt < max_retries - 1:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
+                    continue
+                return None
+
+            last_resp = resp
+            if resp.status_code == 200:
+                return resp
+
+            # Rate-limited: honor the reset header when present, else back off.
+            if resp.status_code in (403, 429):
+                remaining = resp.headers.get("X-RateLimit-Remaining", "")
+                is_rl = remaining == "0" or resp.status_code == 429
+                if is_rl and attempt < max_retries - 1:
+                    wait = backoff
+                    reset = resp.headers.get("X-RateLimit-Reset", "")
+                    retry_after = resp.headers.get("Retry-After", "")
+                    if retry_after.isdigit():
+                        wait = min(float(retry_after), 60.0)
+                    elif reset.isdigit():
+                        delta = float(reset) - time.time()
+                        if 0 < delta <= 60.0:
+                            wait = delta
+                    logger.debug(
+                        "GitHub rate limited on %s, waiting %.1fs (attempt %d/%d)",
+                        url, wait, attempt + 1, max_retries,
+                    )
+                    time.sleep(wait)
+                    backoff = min(backoff * 2, 30.0)
+                    continue
+                # Out of retries (or not a rate-limit 403) — flag and return.
+                self._check_rate_limit_response(resp)
+                return resp
+
+            # 5xx — retry; 4xx (other than rate limit) — return immediately.
+            if 500 <= resp.status_code < 600 and attempt < max_retries - 1:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+                continue
+            return resp
+
+        return last_resp
+
 
     def _download_directory(self, repo: str, path: str) -> Dict[str, str]:
         """Recursively download all text files from a GitHub directory.
@@ -769,17 +851,12 @@ class GitHubSource(SkillSource):
     def _fetch_file_content(self, repo: str, path: str) -> Optional[str]:
         """Fetch a single file's content from GitHub."""
         url = f"https://api.github.com/repos/{repo}/contents/{path}"
-        try:
-            resp = httpx.get(
-                url,
-                headers={**self.auth.get_headers(), "Accept": "application/vnd.github.v3.raw"},
-                timeout=15, follow_redirects=True,
-            )
-            if resp.status_code == 200:
-                return resp.text
-            self._check_rate_limit_response(resp)
-        except httpx.HTTPError as e:
-            logger.debug("GitHub contents API fetch failed: %s", e)
+        resp = self._github_get(
+            url,
+            headers={**self.auth.get_headers(), "Accept": "application/vnd.github.v3.raw"},
+        )
+        if resp is not None and resp.status_code == 200:
+            return resp.text
         return None
 
     def _get_skillsh_groupings(self, repo: str) -> Optional[Dict[str, str]]:
@@ -1871,6 +1948,12 @@ class ClawHubSource(SkillSource):
 
     BASE_URL = "https://clawhub.ai/api/v1"
 
+    # Wall-clock budget for a full catalog walk. ClawHub has 50k+ skills and
+    # the walk is sequential (~250 requests, each under per-request
+    # timeout=30 so nothing errors), so an unbounded walk can block for
+    # minutes. Bound it so a slow/large catalog cannot hang the caller.
+    CATALOG_WALK_BUDGET_SECONDS = 12
+
     def source_id(self) -> str:
         return "clawhub"
 
@@ -2038,12 +2121,13 @@ class ClawHubSource(SkillSource):
             if results:
                 return results
         else:
-            # Empty query: route through the paginating catalog walker so the
-            # full ClawHub catalog (20k+ skills) lands in the index. The
-            # single-request listing path below caps at one page (200 items)
-            # regardless of `limit`, which silently truncates the public
-            # skills index. The catalog walker follows `nextCursor`.
-            catalog = self._load_catalog_index()
+            # Empty query: route through the paginating catalog walker. When
+            # the full catalog is already disk-cached this returns it whole and
+            # the caller paginates client-side. On a cold cache, bound the walk
+            # to `limit` so a browse command renders its first page without
+            # walking the entire 50k+ catalog (max_items=0 → unbounded, used
+            # only by the offline index builder via search("", limit=0)).
+            catalog = self._load_catalog_index(max_items=limit if limit > 0 else 0)
             if catalog:
                 return self._dedupe_results(catalog)[:limit] if limit > 0 else self._dedupe_results(catalog)
 
@@ -2168,7 +2252,21 @@ class ClawHubSource(SkillSource):
         _write_index_cache(cache_key, [_skill_meta_to_dict(s) for s in results])
         return results
 
-    def _load_catalog_index(self) -> List[SkillMeta]:
+    def _load_catalog_index(self, max_items: int = 0) -> List[SkillMeta]:
+        """Walk the ClawHub catalog via cursor pagination.
+
+        ``max_items`` bounds the walk: once at least that many distinct skills
+        have been gathered the walk stops early. This is what browse's
+        cold-start fallback wants — it only renders one page, so walking the
+        entire 50k+ catalog just to slice off the first N is pure waste.
+        ``max_items=0`` (the default, used by the offline index builder) means
+        walk to exhaustion.
+
+        Caching: only a *complete* catalog (cursor exhausted or page cap) is
+        written to the shared ``clawhub_catalog_v1`` cache. A walk truncated by
+        ``max_items`` OR the wall-clock budget is partial, so caching it would
+        poison the full-catalog cache with an incomplete slice.
+        """
         cache_key = "clawhub_catalog_v1"
         cached = _read_index_cache(cache_key)
         if cached is not None:
@@ -2183,8 +2281,22 @@ class ClawHubSource(SkillSource):
         # terminates well before this on `nextCursor` going None — the cap is
         # a safety rail against an infinite-cursor loop.
         max_pages = 750
+        # Wall-clock budget is for interactive browse (max_items > 0) only.
+        # The offline index builder passes max_items=0 and must walk the full
+        # catalog — a 12s cap there ships ~3k skills and trips the deploy
+        # health floor (20k).
+        deadline = (
+            time.monotonic() + self.CATALOG_WALK_BUDGET_SECONDS
+            if max_items > 0
+            else None
+        )
+        hit_deadline = False
+        hit_max_items = False
 
         for _ in range(max_pages):
+            if deadline is not None and time.monotonic() > deadline:
+                hit_deadline = True
+                break
             params: Dict[str, Any] = {"limit": 200}
             if cursor:
                 params["cursor"] = cursor
@@ -2222,7 +2334,19 @@ class ClawHubSource(SkillSource):
             if not isinstance(cursor, str) or not cursor:
                 break
 
-        _write_index_cache(cache_key, [_skill_meta_to_dict(s) for s in results])
+            # Browse's cold-start fallback only renders one page, so stop as
+            # soon as we have enough to satisfy the caller's bound. The index
+            # builder passes max_items=0 (unbounded) and walks to exhaustion.
+            if max_items > 0 and len(results) >= max_items:
+                hit_max_items = True
+                break
+
+        # Only cache a walk that reached a natural stop (cursor exhausted or
+        # page cap). A walk truncated by the wall-clock budget OR by max_items
+        # is partial, so writing it would poison the shared full-catalog cache
+        # with incomplete data.
+        if not hit_deadline and not hit_max_items:
+            _write_index_cache(cache_key, [_skill_meta_to_dict(s) for s in results])
         return results
 
     def _get_json(self, url: str, timeout: int = 20) -> Optional[Any]:
@@ -2374,9 +2498,18 @@ class ClaudeMarketplaceSource(SkillSource):
 
     def __init__(self, auth: GitHubAuth):
         self.auth = auth
+        # Persistent GitHubSource so rate-limit state survives across the
+        # marketplace-index fetch + per-skill inspect calls and can be
+        # surfaced to the index builder (see is_rate_limited).
+        self.github = GitHubSource(auth=auth)
 
     def source_id(self) -> str:
         return "claude-marketplace"
+
+    @property
+    def is_rate_limited(self) -> bool:
+        """Whether the underlying GitHub API hit a rate limit during the crawl."""
+        return self.github.is_rate_limited
 
     def trust_level_for(self, identifier: str) -> str:
         parts = identifier.split("/", 2)
@@ -2416,15 +2549,13 @@ class ClaudeMarketplaceSource(SkillSource):
 
     def fetch(self, identifier: str) -> Optional[SkillBundle]:
         # Delegate to GitHub Contents API since marketplace skills live in GitHub repos
-        gh = GitHubSource(auth=self.auth)
-        bundle = gh.fetch(identifier)
+        bundle = self.github.fetch(identifier)
         if bundle:
             bundle.source = "claude-marketplace"
         return bundle
 
     def inspect(self, identifier: str) -> Optional[SkillMeta]:
-        gh = GitHubSource(auth=self.auth)
-        meta = gh.inspect(identifier)
+        meta = self.github.inspect(identifier)
         if meta:
             meta.source = "claude-marketplace"
             meta.trust_level = self.trust_level_for(identifier)
@@ -2438,16 +2569,15 @@ class ClaudeMarketplaceSource(SkillSource):
             return cached
 
         url = f"https://api.github.com/repos/{repo}/contents/.claude-plugin/marketplace.json"
+        resp = self.github._github_get(
+            url,
+            headers={**self.auth.get_headers(), "Accept": "application/vnd.github.v3.raw"},
+        )
+        if resp is None or resp.status_code != 200:
+            return []
         try:
-            resp = httpx.get(
-                url,
-                headers={**self.auth.get_headers(), "Accept": "application/vnd.github.v3.raw"},
-                timeout=15,
-            )
-            if resp.status_code != 200:
-                return []
             data = json.loads(resp.text)
-        except (httpx.HTTPError, json.JSONDecodeError):
+        except json.JSONDecodeError:
             return []
 
         plugins = data.get("plugins", [])
@@ -3617,8 +3747,9 @@ _DEFAULT_ARD_REGISTRIES: List[str] = [
 
 # ARD media-type constants (IANA-style, per spec §3)
 ARD_TYPE_SKILL = "application/ai-skill"
-ARD_TYPE_MCP_SERVER = "application/mcp-server+json"
 ARD_TYPE_MCP_SERVER_CARD = "application/mcp-server-card+json"
+# Legacy transition alias accepted by older ARD/HF Discover deployments.
+ARD_TYPE_MCP_SERVER = "application/mcp-server+json"
 ARD_TYPE_A2A_AGENT = "application/a2a-agent-card+json"
 
 # All recognized MCP-type media types
@@ -3647,6 +3778,21 @@ def _get_ard_registries() -> List[str]:
         pass
     return list(_DEFAULT_ARD_REGISTRIES)
 
+
+
+
+def _ard_search_url(registry_url: str) -> str:
+    """Return a POST /search URL from a registry base URL or search endpoint."""
+    cleaned = registry_url.rstrip("/")
+    return cleaned if cleaned.endswith("/search") else cleaned + "/search"
+
+
+def _ard_catalog_url(registry_url: str) -> str:
+    """Return /.well-known/ai-catalog.json for a registry base/search URL."""
+    cleaned = registry_url.rstrip("/")
+    if cleaned.endswith("/search"):
+        cleaned = cleaned[: -len("/search")]
+    return cleaned + "/.well-known/ai-catalog.json"
 
 def _guarded_http_post_json(
     url: str, json_body: dict, *, timeout: int = 20,
@@ -3686,13 +3832,13 @@ class ArdSource(SkillSource):
 
     Implements the Agentic Resource Discovery specification (v0.9 Draft):
     - Queries ``POST /search`` on ARD registries with natural-language text
-    - Supports type filtering (application/ai-skill, application/mcp-server+json, etc.)
+    - Supports type filtering (application/ai-skill, application/mcp-server-card+json, etc.)
     - Supports federation modes (auto, referrals, none)
     - Falls back to static ``/.well-known/ai-catalog.json`` when /search is unavailable
 
     ARD entries are mapped to SkillMeta:
     - ``application/ai-skill``     → standard skill (name, description)
-    - ``application/mcp-server+json`` → stored in extra['mcp'] for auto-registration
+    - ``application/mcp-server-card+json`` → stored in extra['mcp'] for auto-registration
     - ``application/a2a-agent-card+json`` → stored in extra['a2a'] (informational)
 
     When the agent requests an ARD result of type MCP, ArdSource.fetch() triggers
@@ -3769,20 +3915,27 @@ class ArdSource(SkillSource):
 
         Parses the federation response for referral entries.
         """
-        search_url = registry_url.rstrip("/") + "/search"
+        search_url = _ard_search_url(registry_url)
         body = {
             "query": {
                 "text": query or "",
                 "filter": {
                     "type": [
                         ARD_TYPE_SKILL,
-                        ARD_TYPE_MCP_SERVER,
                         ARD_TYPE_MCP_SERVER_CARD,
+                        ARD_TYPE_MCP_SERVER,  # legacy transition alias
                     ],
                 },
             },
+            "federation": "referrals",
             "pageSize": min(limit, 20),
         }
+
+        # Try local cache first (offline/fast path). This includes imported MCP
+        # Registry and GitDB candidate catalogs, not only registry-specific cache.
+        cached = _search_ard_cache(query, limit, registry_url)
+        if cached is not None:
+            return cached, []
 
         data = _guarded_http_post_json(search_url, body, timeout=20)
         if data is None:
@@ -3793,15 +3946,20 @@ class ArdSource(SkillSource):
         entries = data.get("results") or data.get("entries") or []
         results = [self._entry_to_meta(e, registry_url) for e in entries if e][:limit]
 
-        # Extract referrals from federation response
+        # Extract referrals from the spec-compliant root-level field.  Older
+        # prototype registries sometimes nested this under federation.referrals,
+        # so accept both shapes.
         referrals: List[str] = []
-        fed_info = data.get("federation") or {}
-        if isinstance(fed_info, dict):
-            ref_list = fed_info.get("referrals", [])
-            if isinstance(ref_list, list):
-                for ref in ref_list:
-                    if isinstance(ref, str) and ref.startswith("http"):
-                        referrals.append(ref)
+        ref_list = data.get("referrals")
+        if ref_list is None:
+            fed_info = data.get("federation") or {}
+            if isinstance(fed_info, dict):
+                ref_list = fed_info.get("referrals", [])
+        if isinstance(ref_list, list):
+            for ref in ref_list:
+                ref_url = ref.get("url") if isinstance(ref, dict) else ref
+                if isinstance(ref_url, str) and ref_url.startswith("http"):
+                    referrals.append(ref_url)
 
         return results, referrals
 
@@ -3814,18 +3972,19 @@ class ArdSource(SkillSource):
         if cached is not None:
             return cached
 
-        search_url = registry_url.rstrip("/") + "/search"
+        search_url = _ard_search_url(registry_url)
         body = {
             "query": {
                 "text": query or "",
                 "filter": {
                     "type": [
                         ARD_TYPE_SKILL,
-                        ARD_TYPE_MCP_SERVER,
                         ARD_TYPE_MCP_SERVER_CARD,
+                        ARD_TYPE_MCP_SERVER,  # legacy transition alias
                     ],
                 },
             },
+            "federation": "none",
             "pageSize": min(limit, 20),
         }
 
@@ -3848,7 +4007,7 @@ class ArdSource(SkillSource):
         if cached and (now - cached[0]) < _ARD_CACHE_TTL:
             catalog = cached[1]
         else:
-            catalog_url = registry_url.rstrip("/") + "/.well-known/ai-catalog.json"
+            catalog_url = _ard_catalog_url(registry_url)
             resp = _guarded_http_get(catalog_url, timeout=15)
             if resp is None or resp.status_code != 200:
                 return []
@@ -3892,12 +4051,14 @@ class ArdSource(SkillSource):
             else []
         )
         metadata = entry.get("metadata", {}) if isinstance(entry.get("metadata"), dict) else {}
+        inline_data = entry.get("data", {}) if isinstance(entry.get("data"), dict) else {}
 
         extra: Dict[str, Any] = {
             "ard_type": entry_type,
             "ard_registry": registry_url,
             "representativeQueries": rep_queries,
             "source_url": url,
+            "ard_data": inline_data,
         }
 
         # For MCP server entries (including server cards), construct the
@@ -3905,7 +4066,8 @@ class ArdSource(SkillSource):
         #   spaceId: "user/space" → https://user-space.hf.space/gradio_api/mcp
         if entry_type in _ARD_MCP_TYPES:
             mcp_url = url
-            transport = "streamable_http"
+            command = inline_data.get("command")
+            transport = inline_data.get("transport") or ("stdio" if command else "streamable_http")
 
             # If the URL points to a server.json card file, we need to
             # either fetch it (deferred to fetch()) or construct the
@@ -3923,13 +4085,17 @@ class ArdSource(SkillSource):
                     )
                     transport = "streamable_http"
 
-            extra["mcp"] = {
+            mcp_config = {
                 "url": mcp_url,
                 "name": display_name,
                 "transport": transport,
                 "card_url": url if "server.json" in url else None,
                 "space_id": space_id or None,
             }
+            for key in ("command", "args", "env", "workdir"):
+                if key in inline_data:
+                    mcp_config[key] = inline_data[key]
+            extra["mcp"] = mcp_config
         elif entry_type == ARD_TYPE_A2A_AGENT:
             extra["a2a"] = {"url": url}
 
@@ -3983,7 +4149,7 @@ class ArdSource(SkillSource):
         if cached and (now - cached[0]) < _ARD_CACHE_TTL:
             return cached[1]
 
-        catalog_url = registry_url.rstrip("/") + "/.well-known/ai-catalog.json"
+        catalog_url = _ard_catalog_url(registry_url)
         resp = _guarded_http_get(catalog_url, timeout=15)
         if resp is None or resp.status_code != 200:
             return None
@@ -4026,6 +4192,32 @@ class ArdSource(SkillSource):
                 metadata={
                     "ard_type": ARD_TYPE_MCP_SERVER,
                     "mcp": meta.extra.get("mcp", {}),
+                },
+            )
+
+        # Standard skill: inline data entries can still be installed as a
+        # minimal SKILL.md. Remote catalogs often use inline `data` when there
+        # is no stable artifact URL.
+        inline_data = meta.extra.get("ard_data") or {}
+        if not source_url and isinstance(inline_data, dict) and inline_data:
+            name = inline_data.get("name", meta.name)
+            desc = inline_data.get("description", meta.description)
+            content = (
+                "---\n"
+                f"name: {name}\n"
+                f"description: {str(desc).replace(chr(10), ' ')}\n"
+                "---\n\n"
+                f"# {name}\n\n{desc}\n"
+            )
+            return SkillBundle(
+                name=meta.name,
+                files={"SKILL.md": content},
+                source="ard",
+                identifier=identifier,
+                trust_level="community",
+                metadata={
+                    "ard_type": ARD_TYPE_SKILL,
+                    "ard_registry": meta.extra.get("ard_registry", ""),
                 },
             )
 
@@ -4101,25 +4293,100 @@ def is_mcp_bundle(bundle: SkillBundle) -> bool:
 _ARD_CACHE: Optional[List[Dict[str, Any]]] = None
 
 
-def _load_ard_cache() -> List[Dict[str, Any]]:
-    """Load cached ARD entries from disk (built by scripts/build_ard_cache.py).
+def _ard_cache_paths() -> List[Path]:
+    """Return ARD cache files in precedence order.
 
+    Historical builds wrote `ard-cache.json` under `skills/.hub`; newer ARD
+    importers write profile-level catalogs under `~/.hermes/.hub`. Search should
+    read all of them so imported MCP Registry and GitDB candidates are usable
+    without re-querying remote registries.
+    """
+    profile_hub = HERMES_HOME / ".hub"
+    candidates = [
+        HUB_DIR / "ard-cache.json",
+        profile_hub / "ard-cache.json",
+        profile_hub / "ard-mcp-registry-cache.json",
+        profile_hub / "ard-gitdb-candidates.json",
+    ]
+    seen: set[Path] = set()
+    paths: List[Path] = []
+    for path in candidates:
+        if path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def _load_ard_cache() -> List[Dict[str, Any]]:
+    """Load cached ARD entries from disk.
+
+    Supports the legacy `scripts/build_ard_cache.py` cache and newer imported
+    ARD catalogs (`mcp_registry_to_ard_cache.py`, `gitdb_to_ard_catalog.py`).
     Returns empty list if no cache exists. Cache is loaded once per session.
     """
     global _ARD_CACHE
     if _ARD_CACHE is not None:
         return _ARD_CACHE
-    cache_path = HUB_DIR / "ard-cache.json"
-    if not cache_path.exists():
-        _ARD_CACHE = []
-        return _ARD_CACHE
-    try:
-        data = json.loads(cache_path.read_text(encoding="utf-8"))
-        entries = data.get("entries", []) if isinstance(data, dict) else []
-        _ARD_CACHE = entries if isinstance(entries, list) else []
-    except (ValueError, OSError):
-        _ARD_CACHE = []
+
+    entries_by_id: Dict[str, Dict[str, Any]] = {}
+    for cache_path in _ard_cache_paths():
+        if not cache_path.exists():
+            continue
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            entries = data.get("entries", []) if isinstance(data, dict) else []
+        except (ValueError, OSError):
+            continue
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            identifier = str(entry.get("identifier") or "")
+            if identifier and identifier not in entries_by_id:
+                enriched = dict(entry)
+                enriched.setdefault("cache_file", str(cache_path))
+                entries_by_id[identifier] = enriched
+    _ARD_CACHE = list(entries_by_id.values())
     return _ARD_CACHE
+
+
+def _ard_entry_search_text(entry: Dict[str, Any]) -> str:
+    """Return normalized text used by ARD keyword/embedding search."""
+    parts: List[str] = [
+        str(entry.get("displayName", "")),
+        str(entry.get("description", "")),
+        " ".join(str(t) for t in entry.get("tags", [])),
+        " ".join(str(a) for a in entry.get("aliases", [])),
+        " ".join(str(q) for q in entry.get("representativeQueries", [])),
+    ]
+    data = entry.get("data")
+    if isinstance(data, dict):
+        parts.extend([
+            " ".join(str(a) for a in data.get("aliases", []) if isinstance(data.get("aliases", []), list)),
+            " ".join(str(q) for q in data.get("representativeQueries", []) if isinstance(data.get("representativeQueries", []), list)),
+        ])
+    metadata = entry.get("metadata")
+    if isinstance(metadata, dict):
+        parts.append(" ".join(str(t) for t in metadata.get("keywords", []) if isinstance(metadata.get("keywords", []), list)))
+    return " ".join(p for p in parts if p).lower()
+
+
+def _cache_entry_matches_registry(entry: Dict[str, Any], registry_url: str) -> bool:
+    """Return whether a cached ARD entry should satisfy a registry-specific query."""
+    explicit_registry = entry.get("registry")
+    if explicit_registry:
+        return registry_url in str(explicit_registry)
+    metadata_raw = entry.get("metadata")
+    metadata: Dict[str, Any] = metadata_raw if isinstance(metadata_raw, dict) else {}
+    source = str(metadata.get("source", ""))
+    identifier = str(entry.get("identifier", ""))
+    registry_lower = registry_url.lower()
+    if "registry.modelcontextprotocol.io" in registry_lower:
+        return source == "official-mcp-registry" or "registry.modelcontextprotocol.io" in identifier
+    if "gitdb" in registry_lower:
+        return source == "gitdb-github-watch" or identifier.startswith("urn:ai:gitdb.local:")
+    return False
 
 
 def _search_ard_cache(
@@ -4134,11 +4401,13 @@ def _search_ard_cache(
     if not entries:
         return None
 
-    # Check if cache has entries for this registry
+    # If legacy cache entries are explicitly tied to a registry, honor that.
+    # Imported catalog caches (MCP Registry, GitDB candidates) intentionally do
+    # not carry `registry`; they should be globally searchable.
     if registry_url:
         reg_entries = [
             e for e in entries
-            if isinstance(e, dict) and registry_url in str(e.get("registry", ""))
+            if isinstance(e, dict) and _cache_entry_matches_registry(e, registry_url)
         ]
         if not reg_entries:
             return None
@@ -4159,11 +4428,22 @@ def _search_ard_cache(
         if not query_words:
             score = 50
         else:
-            haystack = f"{name} {desc} {tags}".lower()
+            haystack = _ard_entry_search_text(entry)
             matches = sum(1 for w in query_words if w in haystack)
             if matches == 0:
                 continue
             score = int((matches / max(len(query_words), 1)) * 100)
+
+        metadata = entry.get("metadata", {}) if isinstance(entry.get("metadata"), dict) else {}
+        entry_type = str(entry.get("type", ARD_TYPE_SKILL))
+        mcp = entry.get("mcp")
+        if mcp is None and entry_type in _ARD_MCP_TYPES:
+            transport = str(metadata.get("transport") or "streamable_http").replace("-", "_")
+            mcp = {
+                "name": name,
+                "url": entry.get("url", ""),
+                "transport": transport,
+            }
 
         meta = SkillMeta(
             name=name,
@@ -4173,10 +4453,11 @@ def _search_ard_cache(
             trust_level="community",
             tags=entry.get("tags", []),
             extra={
-                "ard_type": entry.get("type", ARD_TYPE_SKILL),
+                "ard_type": entry_type,
                 "ard_registry": entry.get("registry", registry_url),
-                "source_url": entry.get("source_url", ""),
-                "mcp": entry.get("mcp"),
+                "source_url": entry.get("source_url") or entry.get("url", ""),
+                "cache_file": entry.get("cache_file", ""),
+                "mcp": mcp,
                 "from_cache": True,
             },
         )
@@ -4195,13 +4476,16 @@ def get_mcp_config_from_bundle(bundle: SkillBundle) -> Optional[Dict[str, Any]]:
     if not is_mcp_bundle(bundle):
         return None
     mcp = bundle.metadata.get("mcp", {})
-    if not mcp.get("url"):
+    if not (mcp.get("url") or mcp.get("command")):
         return None
-    return {
+    cfg = {
         "name": mcp.get("name", bundle.name),
-        "url": mcp["url"],
         "transport": mcp.get("transport", "streamable_http"),
     }
+    for key in ("url", "command", "args", "env", "workdir"):
+        if key in mcp and mcp.get(key) not in (None, ""):
+            cfg[key] = mcp[key]
+    return cfg
 
 
 def create_source_router(auth: Optional[GitHubAuth] = None) -> List[SkillSource]:
@@ -4294,13 +4578,20 @@ def parallel_search_sources(
     if not active:
         return all_results, source_counts, timed_out_ids
 
-    with ThreadPoolExecutor(max_workers=min(len(active), 8)) as pool:
-        futures = {}
-        for src in active:
-            lim = per_source_limits.get(src.source_id(), 50)
-            fut = pool.submit(_search_one_source, src, query, lim)
-            futures[fut] = src.source_id()
+    # NOTE: a `with ThreadPoolExecutor(...) as pool` block calls
+    # ``shutdown(wait=True)`` on exit, which blocks until every submitted
+    # worker finishes — so a single slow source (e.g. ClawHub) keeps the
+    # caller blocked for minutes and renders ``overall_timeout`` a no-op.
+    # Manage the executor manually and shut it down with ``wait=False`` so
+    # the timeout is actually honoured.
+    pool = ThreadPoolExecutor(max_workers=min(len(active), 8))
+    futures = {}
+    for src in active:
+        lim = per_source_limits.get(src.source_id(), 50)
+        fut = pool.submit(_search_one_source, src, query, lim)
+        futures[fut] = src.source_id()
 
+    try:
         try:
             for fut in as_completed(futures, timeout=overall_timeout):
                 try:
@@ -4320,6 +4611,10 @@ def parallel_search_sources(
                     "Skills browse timed out waiting for: %s",
                     ", ".join(timed_out_ids),
                 )
+    finally:
+        # wait=False so a slow source cannot block the caller's return;
+        # cancel_futures drops not-yet-started work.
+        pool.shutdown(wait=False, cancel_futures=True)
 
     return all_results, source_counts, timed_out_ids
 
@@ -4354,6 +4649,42 @@ def unified_search(query: str, sources: List[SkillSource],
 # ARD Publisher — export Hermes capabilities as ai-catalog.json
 # ---------------------------------------------------------------------------
 
+def _ard_terms_from_name(name: str) -> List[str]:
+    """Split skill/tool names into reusable ARD alias terms."""
+    terms = [t for t in re.split(r"[^A-Za-z0-9]+", name.lower()) if len(t) >= 2]
+    aliases: List[str] = []
+    for term in terms:
+        if term not in aliases:
+            aliases.append(term)
+    if len(terms) >= 2:
+        joined = " ".join(terms)
+        if joined not in aliases:
+            aliases.append(joined)
+    return aliases[:12]
+
+
+def _ard_representative_queries(name: str, description: str, category: str = "") -> List[str]:
+    """Generate lightweight retrieval hints for local ARD/skill search."""
+    aliases = _ard_terms_from_name(name)
+    base = aliases[-1] if aliases else name.replace("-", " ")
+    queries = [
+        base,
+        f"use {base}",
+        f"find {base} capability",
+    ]
+    if category:
+        queries.append(f"{category} {base}")
+    desc_terms = [t for t in re.split(r"[^A-Za-z0-9]+", description.lower()) if len(t) >= 4][:8]
+    if desc_terms:
+        queries.append(" ".join(desc_terms))
+    deduped: List[str] = []
+    for q in queries:
+        q = q.strip()
+        if q and q not in deduped:
+            deduped.append(q)
+    return deduped[:8]
+
+
 def _generate_ard_skill_entries(
     skills_data: List[Dict[str, Any]],
     domain: str,
@@ -4371,15 +4702,32 @@ def _generate_ard_skill_entries(
         path_parts = [p for p in [category, name] if p]
         urn = f"urn:ai:{domain}:skill:{':'.join(path_parts)}"
 
+        aliases = _ard_terms_from_name(name)
+        representative_queries = _ard_representative_queries(name, description, category)
+        tags = [category] if category else []
+        for alias in aliases[:6]:
+            if alias not in tags:
+                tags.append(alias)
+
         entry = {
             "identifier": urn,
             "displayName": name,
             "type": ARD_TYPE_SKILL,
-            "description": description[:500],  # ARD spec: description max ~500 chars
-            "url": "",  # Local skills have no external URL
+            "description": description[:500],
+            "tags": tags,
+            "aliases": aliases,
+            "representativeQueries": representative_queries,
+            # Local skills are embedded because there is no stable public HTTP
+            # artifact URL for arbitrary profile-local SKILL.md files.
+            "data": {
+                "name": name,
+                "description": description,
+                "category": category,
+                "aliases": aliases,
+                "representativeQueries": representative_queries,
+                "source": "hermes-skill",
+            },
         }
-        if category:
-            entry["tags"] = [category]
         entries.append(entry)
     return entries
 
@@ -4387,6 +4735,7 @@ def _generate_ard_skill_entries(
 def _generate_ard_mcp_entries(
     mcp_servers: Dict[str, dict],
     domain: str,
+    visibility: str = "public",
 ) -> List[Dict[str, Any]]:
     """Convert MCP server config to ARD catalog entries."""
     entries = []
@@ -4395,16 +4744,34 @@ def _generate_ard_mcp_entries(
             continue
         url = cfg.get("url", "")
         if not url:
+            if visibility == "private" and (cfg.get("command") or cfg.get("transport") == "stdio"):
+                urn = f"urn:ai:{domain}:mcp:{name}"
+                entries.append({
+                    "identifier": urn,
+                    "displayName": f"{name} (Local MCP Server)",
+                    "type": ARD_TYPE_MCP_SERVER_CARD,
+                    "description": f"Local/private stdio MCP server: {name}",
+                    "tags": ["mcp-server", "local", "stdio", "private"],
+                    "url": f"stdio:{name}",
+                    "metadata": {
+                        "transport": "stdio",
+                        "visibility": "private",
+                        "source": "hermes-local-mcp",
+                    },
+                })
+            # Public catalogs omit local stdio MCP servers: publishing command,
+            # env, args, or workdir can leak workstation paths/secrets and remote
+            # clients cannot execute them anyway.
             continue
 
         urn = f"urn:ai:{domain}:mcp:{name}"
         entry = {
             "identifier": urn,
             "displayName": f"{name} (MCP Server)",
-            "type": ARD_TYPE_MCP_SERVER,
-            "url": url,
+            "type": ARD_TYPE_MCP_SERVER_CARD,
             "description": f"MCP server: {name}",
             "tags": ["mcp-server"],
+            "url": url,
         }
         entries.append(entry)
     return entries
@@ -4413,6 +4780,7 @@ def _generate_ard_mcp_entries(
 def generate_ard_catalog(
     domain: str = "hermes.local",
     output_path: Optional[str] = None,
+    visibility: str = "public",
 ) -> Dict[str, Any]:
     """Generate an ARD-compatible ai-catalog.json from Hermes capabilities.
 
@@ -4427,6 +4795,9 @@ def generate_ard_catalog(
     Returns:
         The catalog dict (also written to disk if output_path is set).
     """
+    if visibility not in {"public", "private"}:
+        raise ValueError("visibility must be 'public' or 'private'")
+
     catalog: Dict[str, Any] = {
         "specVersion": "1.0",
         "host": {
@@ -4458,7 +4829,7 @@ def generate_ard_catalog(
                 cfg = _yaml.safe_load(f) or {}
             mcp_servers = cfg.get("mcp_servers", {})
             if isinstance(mcp_servers, dict):
-                mcp_entries = _generate_ard_mcp_entries(mcp_servers, domain)
+                mcp_entries = _generate_ard_mcp_entries(mcp_servers, domain, visibility=visibility)
                 catalog["entries"].extend(mcp_entries)
     except Exception as e:
         logger.debug("Failed to collect MCP servers for ARD catalog: %s", e)
@@ -4482,7 +4853,7 @@ def generate_ard_catalog(
                 "type": "application/ai-skill",  # tools are callable skills
                 "description": desc[:500],
                 "tags": ["builtin-tool"],
-                "url": "",  # no external URL — tools are internal to Hermes
+                "data": {"name": tool_name, "source": "hermes-builtin-tool"},
             })
     except Exception as e:
         logger.debug("Failed to collect tools for ARD catalog: %s", e)
@@ -4497,17 +4868,31 @@ def generate_ard_catalog(
     return catalog
 
 
-def publish_ard_catalog(domain: str = "hermes.local") -> Path:
-    """Generate and write ai-catalog.json to ~/.hermes/.well-known/.
+def publish_ard_catalog(
+    domain: str = "hermes.local",
+    visibility: str = "public",
+    output_path: Optional[Union[str, Path]] = None,
+) -> Path:
+    """Generate and write ai-catalog.json.
 
-    Returns the path to the written file.
+    Public catalogs default to ~/.hermes/.well-known/ai-catalog.json. Private
+    catalogs require an explicit output path or are written under ~/.hermes/.hub
+    to avoid accidentally exposing local/private stdio entries via .well-known.
     """
     from hermes_constants import get_hermes_home
 
-    well_known_dir = get_hermes_home() / ".well-known"
-    catalog_path = well_known_dir / "ai-catalog.json"
+    if visibility not in {"public", "private"}:
+        raise ValueError("visibility must be 'public' or 'private'")
 
-    generate_ard_catalog(domain=domain, output_path=str(catalog_path))
+    if output_path is not None:
+        catalog_path = Path(output_path)
+    elif visibility == "public":
+        well_known_dir = get_hermes_home() / ".well-known"
+        catalog_path = well_known_dir / "ai-catalog.json"
+    else:
+        catalog_path = get_hermes_home() / ".hub" / "private-ai-catalog.json"
+
+    generate_ard_catalog(domain=domain, output_path=str(catalog_path), visibility=visibility)
     logger.info("ARD catalog published: %d entries at %s",
                 len(json.loads(catalog_path.read_text())["entries"]),
                 catalog_path)
@@ -4557,11 +4942,7 @@ def ard_local_search(
 
     scored = []
     for entry in entries:
-        haystack = " ".join([
-            str(entry.get("displayName", "")),
-            str(entry.get("description", "")),
-            " ".join(str(t) for t in entry.get("tags", [])),
-        ]).lower()
+        haystack = _ard_entry_search_text(entry)
 
         if not query_words:
             score = 50  # neutral score for empty query (browse mode)
