@@ -28,6 +28,73 @@ from tools.registry import tool_error
 logger = logging.getLogger(__name__)
 
 # Circuit breaker: after this many consecutive failures, pause API calls
+
+
+class _SelfHostedMem0Client:
+    """Thin httpx-based client for self-hosted mem0-compatible APIs.
+
+    The upstream mem0 SDK (v2.x) hardcodes ``/v3/memories/`` endpoints,
+    which don't exist on self-hosted instances like ProxyPal that use
+    ``/memories`` and ``/search`` without a version prefix. This wrapper
+    implements the subset of MemoryClient methods the plugin uses
+    (``add``, ``get_all``, ``search``, ``delete``) via direct HTTP calls.
+    """
+
+    def __init__(self, host: str, api_key: str) -> None:
+        import httpx
+        self.host = host
+        self._http = httpx.Client(
+            base_url=host,
+            headers={
+                "Authorization": f"Token {api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=300,
+        )
+
+    def add(self, messages, infer: bool = True, user_id: str = None,
+            agent_id: str = None, **kwargs) -> dict:
+        payload: dict = {"messages": messages, "infer": infer}
+        if user_id:
+            payload["user_id"] = user_id
+        if agent_id:
+            payload["agent_id"] = agent_id
+        resp = self._http.post("/memories", json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_all(self, filters: dict = None, **kwargs) -> dict:
+        params = {}
+        if filters:
+            if filters.get("user_id"):
+                params["user_id"] = filters["user_id"]
+            if filters.get("agent_id"):
+                params["agent_id"] = filters["agent_id"]
+        resp = self._http.get("/memories", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    def search(self, query: str, filters: dict = None, **kwargs) -> dict:
+        payload: dict = {"query": query}
+        if filters:
+            if filters.get("user_id"):
+                payload["user_id"] = filters["user_id"]
+            if filters.get("agent_id"):
+                payload["agent_id"] = filters["agent_id"]
+        resp = self._http.post("/search", json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+    def delete(self, memory_id: str) -> dict:
+        resp = self._http.delete(f"/memories/{memory_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    def close(self) -> None:
+        self._http.close()
+
+
+# Circuit breaker: after this many consecutive failures, pause API calls
 # for _BREAKER_COOLDOWN_SECS to avoid hammering a down server.
 _BREAKER_THRESHOLD = 5
 _BREAKER_COOLDOWN_SECS = 120
@@ -171,12 +238,19 @@ class Mem0MemoryProvider(MemoryProvider):
         with self._client_lock:
             if self._client is not None:
                 return self._client
-            try:
-                from mem0 import MemoryClient
-                self._client = MemoryClient(api_key=self._api_key)
-                return self._client
-            except ImportError:
-                raise RuntimeError("mem0 package not installed. Run: pip install mem0ai")
+            _host = self._config.get("host")
+            if _host:
+                # Self-hosted instances (e.g. ProxyPal) use /memories and
+                # /search endpoints without the /v3/ prefix the mem0 SDK
+                # hardcodes — use a thin httpx wrapper instead.
+                self._client = _SelfHostedMem0Client(host=_host, api_key=self._api_key)
+            else:
+                try:
+                    from mem0 import MemoryClient
+                    self._client = MemoryClient(api_key=self._api_key)
+                except ImportError:
+                    raise RuntimeError("mem0 package not installed. Run: pip install mem0ai")
+            return self._client
 
     def _is_breaker_open(self) -> bool:
         """Return True if the circuit breaker is tripped (too many failures)."""
